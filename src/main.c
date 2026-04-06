@@ -141,6 +141,43 @@ int main(void) {
 
         printf("Received request:\n%s\n", buffer);
 
+        /*
+         * Parse request line
+         */
+        char method[8];
+        char path[1024];
+        sscanf(buffer, "%7s %1023s", method, path);
+        printf("Method: %s\n", method);
+        printf("Path: %s\n", path);
+
+        /*
+         * Create echo response
+         */
+        char response[8192];
+        int body_length = strlen(buffer);
+        int response_length = snprintf(
+            response,
+            sizeof(response),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain\r\n"
+            "Content-Length: %d\r\n"
+            "\r\n"
+            "%s",
+            body_length,
+            buffer
+        );
+
+        /*
+         * Send response
+         */
+        ssize_t bytes_sent = write(client_fd, response, response_length);
+        if (bytes_sent < 0) {
+            perror("write failed");
+        }
+
+        /*
+         * Finish response, close connection
+         */
         close(client_fd);
     }
 
