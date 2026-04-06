@@ -98,11 +98,51 @@ int main(void) {
      * to handle incoming clients.
      */
 
-     // For now, just keep the server running
-    // while (1) {
-        // Placeholder loop
-        // Later: accept() and handle clients here
-    // }
+    while (1) {
+        // server_fd → listening socket (stays open)
+        // client_fd → new socket for each client
+
+        /*
+         * What accept() does
+         *  1. Takes one connection from the queue
+         *  2.Creates a new socket (client_fd)
+         *  3. Returns client address info (optional)
+         *
+         * Important behavior: Blocking call by default → waits until a client connects
+         */
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(server_fd,
+            (struct sockaddr*)&client_addr,
+            &client_len);
+        if (client_fd < 0) {
+            perror("accept");
+            continue; // don't kill server, just try again, go to next connection
+        }
+
+        /*
+         * After accept
+         *  - read from client_fd
+         *  - write to client_fd
+         *  - close client_fd when done
+         */
+
+         /*
+          * Read request into buffer
+          */
+        char buffer[4096];
+        ssize_t bytes_read = read(client_fd, buffer, sizeof(buffer) - 1);
+        if (bytes_read < 0) {
+            perror("read");
+            close(client_fd);
+            continue;
+        }
+        buffer[bytes_read] = '\0';
+
+        printf("Received request:\n%s\n", buffer);
+
+        close(client_fd);
+    }
 
     // Cleanup (unreachable here, but good practice)
     close(server_fd);
