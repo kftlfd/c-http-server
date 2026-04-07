@@ -4,9 +4,34 @@
 #include <unistd.h>     // close()
 #include <arpa/inet.h>  // htons(), htonl(), sockaddr_in, INADDR_ANY
 #include <sys/socket.h> // socket(), bind(), listen(), setsockopt()
+#include <signal.h>     // signal(), sigaction()
+#include <errno.h>      // EINTR
+#include <poll.h>       // poll()
 
 #define PORT 8080       // Port the server will listen on
 #define BACKLOG 10      // Max number of pending connections
+
+/*
+ * Global flag for graceful shutdown.
+ *
+ * volatile: prevents compiler from caching the value in a register,
+ *           ensuring the signal handler's write is visible.
+ * sig_atomic_t: guarantees atomic read/write operations,
+ *                making it safe to use in signal handlers.
+ */
+volatile sig_atomic_t keep_running = 1;
+
+/*
+ * Signal handler for SIGINT and SIGTERM.
+ *
+ * When triggered, sets keep_running to 0 to signal the main
+ * loop to exit. The (void) cast on signum avoids unused
+ * parameter warning since we don't need the signal number.
+ */
+void signal_handler(int signum) {
+    (void)signum;
+    keep_running = 0;
+}
 
 int main(void) {
     int server_fd;
@@ -92,20 +117,66 @@ int main(void) {
     printf("Server is listening on port %d...\n", PORT);
 
     /*
+     * STEP 5: Set up signal handlers for graceful shutdown
+     *
+     * SIGINT:  Sent when user presses Ctrl+C
+     * SIGTERM: Sent by kill command (default for docker stop, etc.)
+     *
+     * When either signal is received, signal_handler sets
+     * keep_running to 0, causing the main loop to exit.
+     */
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    /*
      * At this point, the server is ready to accept connections.
      * Next step would be:
      *   accept()
      * to handle incoming clients.
      */
 
-    while (1) {
+    while (keep_running) {
         // server_fd → listening socket (stays open)
         // client_fd → new socket for each client
 
         /*
+         * Use poll() before accept() to allow signal interruption.
+         *
+         * poll() monitors the server socket for incoming connections.
+         * - pfd.fd: the file descriptor to monitor
+         * - pfd.events: POLLIN means "ready for reading" (connection waiting)
+         * - timeout -1: wait indefinitely until a connection arrives or a
+         *               signal interrupts it
+         *
+         * Why poll() instead of just accept()?
+         *   When a signal (SIGINT/SIGTERM) arrives during accept(), the
+         *   behavior is system-dependent. On some systems, accept() may
+         *   not return until a connection arrives. Using poll() first
+         *   ensures we check the keep_running flag when the signal arrives.
+         */
+        struct pollfd pfd = {
+            .fd = server_fd,
+            .events = POLLIN,
+        };
+
+        int ret = poll(&pfd, 1, -1);
+        if (ret < 0) {
+            /*
+             * EINTR: A signal interrupted the poll() call.
+             * This happens when SIGINT/SIGTERM is received.
+             * Break out of the loop to allow graceful shutdown.
+             */
+            if (errno == EINTR) {
+                break;
+            }
+            perror("poll");
+            continue;
+        }
+
+        /*
          * What accept() does
          *  1. Takes one connection from the queue
-         *  2.Creates a new socket (client_fd)
+         *  2. Creates a new socket (client_fd)
          *  3. Returns client address info (optional)
          *
          * Important behavior: Blocking call by default → waits until a client connects
@@ -189,8 +260,15 @@ int main(void) {
         close(client_fd);
     }
 
-    // Cleanup (unreachable here, but good practice)
+    /*
+     * Cleanup
+     *
+     * Close the server socket and print shutdown message.
+     * This code is now reachable thanks to the graceful shutdown
+     * mechanism (signal_handler + poll() + keep_running).
+     */
     close(server_fd);
+    printf("\nServer shutdown.\n");
 
     return 0;
 }
