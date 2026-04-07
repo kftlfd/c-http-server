@@ -139,7 +139,7 @@ int main(void) {
         }
         buffer[bytes_read] = '\0';
 
-        printf("Received request:\n%s\n", buffer);
+        printf("\nReceived request:\n---\n%s\n---\n", buffer);
 
         /*
          * Parse request line
