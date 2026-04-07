@@ -150,11 +150,17 @@ int main(void) {
         printf("Method: %s\n", method);
         printf("Path: %s\n", path);
 
+        char* body = buffer;
+        char* body_start = strstr(buffer, "\r\n\r\n");
+        if (body_start) {
+            body = body_start + 4;
+        }
+
         /*
          * Create echo response
          */
         char response[8192];
-        int body_length = strlen(buffer);
+        int body_length = strlen(body);
         int response_length = snprintf(
             response,
             sizeof(response),
@@ -164,7 +170,7 @@ int main(void) {
             "\r\n"
             "%s",
             body_length,
-            buffer
+            body
         );
 
         /*
