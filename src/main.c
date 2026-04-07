@@ -248,10 +248,19 @@ int main(void) {
 
         /*
          * Send response
+         *
+         * write() may not send all bytes in one call (partial write).
+         * Loop until all bytes are sent.
          */
-        ssize_t bytes_sent = write(client_fd, response, response_length);
-        if (bytes_sent < 0) {
-            perror("write failed");
+        size_t total_sent = 0;
+        while (total_sent < (size_t)response_length) {
+            ssize_t bytes_sent = write(client_fd, response + total_sent,
+                response_length - total_sent);
+            if (bytes_sent < 0) {
+                perror("write failed");
+                break;
+            }
+            total_sent += bytes_sent;
         }
 
         /*
