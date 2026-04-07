@@ -146,6 +146,8 @@ int main(void) {
          */
         char method[8];
         char path[1024];
+        memset(method, 0, sizeof(method));
+        memset(path, 0, sizeof(path));
         sscanf(buffer, "%7s %1023s", method, path);
         printf("Method: %s\n", method);
         printf("Path: %s\n", path);
