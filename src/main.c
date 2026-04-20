@@ -29,8 +29,8 @@ volatile sig_atomic_t keep_running = 1;
  * parameter warning since we don't need the signal number.
  */
 void signal_handler(int signum) {
-    (void)signum;
-    keep_running = 0;
+    (void)signum;     // explicitly mark parameter as unused
+    keep_running = 0; // stop the main loop
 }
 
 int main(void) {
@@ -46,7 +46,7 @@ int main(void) {
      * 0           -> automatically select protocol (TCP)
      */
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd == -1) {
+    if (server_fd < 0) {
         perror("socket failed");
         exit(EXIT_FAILURE);
     }
@@ -70,24 +70,16 @@ int main(void) {
     printf("Socket created: %d\n", server_fd);
 
     struct sockaddr_in address;
-
-    // Zero out the structure to avoid garbage values
     memset(&address, 0, sizeof(address));
 
-    address.sin_family = AF_INET;          // IPv4
-    address.sin_port = htons(PORT);        // Convert port to network byte order
-
     /*
-     * INADDR_LOOPBACK:
-     *   Bind to localhost (127.0.0.1)
-     *
-     * INADDR_ANY:
-     *   Bind to all available network interfaces
-     *   (localhost, LAN IP, etc.)
-     *
+     * htons() converts 16-bit values to network byte order.
      * htonl() converts 32-bit values to network byte order.
      */
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_family = AF_INET;                       // IPv4
+    address.sin_port = htons(PORT);                     // Convert port to network byte order
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   // localhost => 127.0.0.1
+    // address.sin_addr.s_addr = htonl(INADDR_ANY);     // all available network interfaces => 0.0.0.0
 
     /*
      * bind(socket, address, address_length)
@@ -124,9 +116,25 @@ int main(void) {
      *
      * When either signal is received, signal_handler sets
      * keep_running to 0, causing the main loop to exit.
+     *
+     *
+     * Why not just signal()?
+     * signal(SIGINT, signal_handler);
+     * signal(SIGTERM, signal_handler);
+     *  - signal() may restart syscalls like poll()/accept()
+     *  - sigaction() gives precise control
+     *
+     * We intentionally DO NOT use SA_RESTART
+     * so that poll() returns when interrupted by SIGINT.
      */
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
+    struct sigaction sa;
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);  // no additional signals blocked
+    sa.sa_flags = 0;           // DO NOT use SA_RESTART
+    if (sigaction(SIGINT, &sa, NULL) < 0 || sigaction(SIGTERM, &sa, NULL) < 0) {
+        perror("sigaction failed");
+        exit(EXIT_FAILURE);
+    }
 
     /*
      * At this point, the server is ready to accept connections.
@@ -158,9 +166,7 @@ int main(void) {
             .fd = server_fd,
             .events = POLLIN,
         };
-
-        int ret = poll(&pfd, 1, -1);
-        if (ret < 0) {
+        if (poll(&pfd, 1, -1) < 0) {
             /*
              * EINTR: A signal interrupted the poll() call.
              * This happens when SIGINT/SIGTERM is received.
