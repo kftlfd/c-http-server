@@ -7,10 +7,26 @@
 #include <signal.h>     // signal(), sigaction()
 #include <errno.h>      // EINTR
 #include <poll.h>       // poll()
+#include <limits.h>     // INT_MAX
 
 #define PORT 8080       // Port the server will listen on
 #define BACKLOG 10      // Max number of pending connections
 #define MAX_CLIENTS 10 // Max number of active connections
+#define MAX_REQUEST_SIZE (1024 * 1024) // 1 MB
+
+typedef struct Request {
+    int headers_len;
+    int body_len;
+    char method[8];
+    char path[1024];
+    char* headers;
+    char* body;
+} request_t;
+
+void handle_client(int client_fd);
+int read_request(int fd, request_t* req);
+void free_req(request_t req);
+int write_all(int fd, const char* buf, int len);
 
 /*
  * Global flag for graceful shutdown.
@@ -196,7 +212,14 @@ int main(void) {
 
         // Check all file descriptors
         for (int i = 0; i < nfds; i++) {
-            // Check that POLLIN event is received
+            if (pollfds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                close(pollfds[i].fd);
+                pollfds[i] = pollfds[nfds - 1];
+                nfds--;
+                i--;
+                continue;
+            }
+
             if (!(pollfds[i].revents & POLLIN)) {
                 continue;
             }
@@ -218,6 +241,7 @@ int main(void) {
                     (struct sockaddr*)&client_addr,
                     &client_len);
                 if (client_fd < 0) {
+                    if (errno == EINTR) continue;
                     perror("accept");
                     continue; // don't kill server, just try again, go to next connection
                 }
@@ -227,7 +251,7 @@ int main(void) {
                     nfds++;
                 }
                 else {
-                    printf("Tpp many clients, dropping request\n");
+                    printf("Too many clients, dropping request\n");
                     close(client_fd);
                 }
                 continue;
@@ -243,85 +267,8 @@ int main(void) {
              *  - close client_fd when done
              */
 
-             /*
-              * Read request into buffer
-              */
-            char buffer[4096];
-            ssize_t bytes_read = read(client_fd, buffer, sizeof(buffer) - 1);
-            if (bytes_read <= 0) {
-                // Client closed connection or error
-                perror("read");
-                close(client_fd);
-                // remove fd from array (swap with last)
-                pollfds[i] = pollfds[nfds - 1];
-                nfds--;
-                i--; // re-check the current index (now contains the swapped fd)
-                continue;
-            }
-            buffer[bytes_read] = '\0';
+            handle_client(client_fd);
 
-            printf("\nReceived request:\n---\n%s\n---\n", buffer);
-
-            /*
-             * Parse request line
-             */
-            char method[8];
-            char path[1024];
-            memset(method, 0, sizeof(method));
-            memset(path, 0, sizeof(path));
-            sscanf(buffer, "%7s %1023s", method, path);
-            printf("Method: %s\n", method);
-            printf("Path: %s\n", path);
-
-            /*
-             * Extract request body
-             */
-            char* body = strstr(buffer, "\r\n\r\n");
-            if (body != NULL) {
-                body += 4;
-            }
-            else {
-                body = "";
-            }
-            int body_len = strlen(body);
-
-            /*
-             * Create echo response
-             */
-            char response[8192];
-            int response_length = snprintf(
-                response,
-                sizeof(response),
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: text/plain\r\n"
-                "Content-Length: %d\r\n"
-                "\r\n"
-                "%s",
-                body_len,
-                body
-            );
-
-            /*
-             * Send response
-             *
-             * write() may not send all bytes in one call (partial write).
-             * Loop until all bytes are sent.
-             */
-            size_t total_sent = 0;
-            while (total_sent < (size_t)response_length) {
-                ssize_t bytes_sent = write(
-                    client_fd,
-                    response + total_sent,
-                    response_length - total_sent
-                );
-                if (bytes_sent < 0) {
-                    perror("write failed");
-                    break;
-                }
-                total_sent += bytes_sent;
-            }
-
-            // Finish response, close connection
             close(client_fd);
 
             // Remove fd from poll list
@@ -338,11 +285,222 @@ int main(void) {
      * This code is now reachable thanks to the graceful shutdown
      * mechanism (signal_handler + poll() + keep_running).
      */
-    printf("\nShutting down server...\n");
+    printf("Shutting down server...\n");
     for (int i = 0; i < nfds; i++) {
         close(pollfds[i].fd);
     }
-    printf("\nServer shutdown.\n");
+    printf("Server shutdown.\n");
+
+    return 0;
+}
+
+void handle_client(int client_fd) {
+    // Read request
+    request_t req;
+    memset(&req, 0, sizeof(req));
+    if (read_request(client_fd, &req) < 0) {
+        perror("read request");
+        return;
+    }
+
+    printf(
+        "---\n"
+        "Received request: %s %s\n\n"
+        "%s\n\n"
+        "%s\n"
+        "---\n",
+        req.method, req.path,
+        req.headers, req.body
+    );
+
+    // Create echo response
+    if (req.body_len > INT_MAX - 4096) {
+        free_req(req);
+        return;
+    }
+
+    int response_cap = 4096 + req.body_len;
+    char* response = malloc(sizeof(char) * response_cap);
+
+    if (response == NULL) {
+        perror("allocate response");
+        free_req(req);
+        return;
+    }
+
+    int response_length = snprintf(
+        response,
+        response_cap,
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: %d\r\n"
+        "\r\n"
+        "%s",
+        req.body_len,
+        req.body
+    );
+    if (response_length < 0 || response_length >= response_cap) {
+        fprintf(stderr, "write response: sprintf failed or truncated\n");
+        free(response);
+        free_req(req);
+        return;
+    }
+
+    // Send response
+    if (write_all(client_fd, response, response_length) < 0) {
+        perror("send response");
+    }
+
+    free(response);
+    free_req(req);
+}
+
+/*
+ * read request from socket (handles partial reads)
+ */
+int read_request(int fd, request_t* req) {
+    if (req == NULL) {
+        return -1;
+    }
+    /*
+     * Read until:
+     * - hheaders are complete ("\r\n\r\n")
+     * - AND full body is read (via Content-Length)
+     */
+
+    int capacity = 4096;
+    int total = 0;
+    char* buffer = malloc(capacity);
+    if (buffer == NULL) return -1;
+
+    int headers_done = 0;
+    int content_len = 0;
+    int has_content_len = 0;
+
+    char* headers_end = NULL;
+
+    char* headers = NULL;
+    int headers_len = 0;
+
+    char* body = NULL;
+    int body_len = 0;
+
+    while (1) {
+        if (total + 1 >= capacity) {
+            capacity *= 2;
+            char* tmp = realloc(buffer, capacity);
+            if (tmp == NULL) goto err_cleanup;
+            buffer = tmp;
+        }
+
+        ssize_t n = read(fd, buffer + total, capacity - total);
+
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            else goto err_cleanup;
+        }
+        if (n == 0) break;
+
+        total += n;
+        if (total > MAX_REQUEST_SIZE) goto err_cleanup;
+
+        buffer[total] = '\0';
+
+        // Detect end of headers
+        if (!headers_done) {
+            headers_end = strstr(buffer, "\r\n\r\n");
+            if (headers_end != NULL) {
+                headers_done = 1;
+
+                // Save headers
+                headers_len = headers_end - buffer + 4;
+                headers = malloc(sizeof(char) * headers_len);
+                if (headers == NULL) goto err_cleanup;
+
+                memcpy(headers, buffer, headers_len - 1);
+                headers[headers_len - 1] = '\0';
+
+                // Parse Content-Length
+                char* cl = strstr(buffer, "Content-Length:");
+                if (cl != NULL) {
+                    has_content_len = 1;
+                    if (sscanf(cl, "Content-Length: %d", &content_len) != 1) goto err_cleanup;
+                    if (content_len < 0 || content_len > MAX_REQUEST_SIZE) goto err_cleanup;
+                }
+            }
+        }
+
+        if (headers_done) {
+            body_len = total - (headers_end + 4 - buffer);
+
+            if (body_len >= content_len) {
+                break;
+            }
+        }
+    }
+
+    if (total <= 0 || headers_end == NULL) goto err_cleanup;
+
+    // Parse request line
+    memset(req->method, 0, sizeof(req->method));
+    memset(req->path, 0, sizeof(req->path));
+    if (sscanf(headers, "%7s %1023s", req->method, req->path) != 2) goto err_cleanup;
+
+    // Save headers
+    req->headers = headers;
+    req->headers_len = headers_len;
+
+    // Save body
+    body_len = total - (headers_end + 4 - buffer);
+    if (has_content_len) {
+        if (body_len < 0 || body_len != content_len) goto err_cleanup;
+
+        body = malloc(sizeof(char) * (body_len + 1));
+        if (body == NULL) goto err_cleanup;
+
+        memcpy(body, headers_end + 4, body_len);
+        body[body_len] = '\0';
+
+        req->body_len = body_len;
+        req->body = body;
+    }
+    else if (body_len > 0) {
+        goto err_cleanup;
+    }
+
+    free(buffer);
+    return 1;
+
+err_cleanup:
+    free(buffer);
+    free(headers);
+    free(body);
+    return -1;
+}
+
+void free_req(request_t req) {
+    free(req.headers);
+    free(req.body);
+}
+
+/*
+ * write all bytes to socket (handles partial writes)
+ */
+int write_all(int fd, const char* buf, int len) {
+    /*
+     * write() may not send all bytes in one call (partial write).
+     * Loop until all bytes are sent.
+     */
+    int total = 0;
+
+    while (total < len) {
+        ssize_t n = write(fd, buf + total, len - total);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            return -1;
+        }
+        total += n;
+    }
 
     return 0;
 }
