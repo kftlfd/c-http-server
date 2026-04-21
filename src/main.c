@@ -155,6 +155,14 @@ int main(void) {
     }
 
     /*
+     * If client closes connection / crashed / reset the socket
+     * during sending response with `write()` -> kernel may send SIGPIPE
+     * by default it terminates the process immediately
+     * ignore it instead
+     */
+    signal(SIGPIPE, SIG_IGN);
+
+    /*
      * At this point, the server is ready to accept connections.
      * Next step would be:
      *   accept()
