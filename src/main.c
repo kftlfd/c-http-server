@@ -8,6 +8,7 @@
 #include <errno.h>      // EINTR
 #include <poll.h>       // poll()
 #include <limits.h>     // INT_MAX
+#include <fcntl.h>      // fcntl(), O_NONBLOCK
 
 #define PORT 8080       // Port the server will listen on
 #define BACKLOG 10      // Max number of pending connections
@@ -245,6 +246,20 @@ int main(void) {
                     perror("accept");
                     continue; // don't kill server, just try again, go to next connection
                 }
+
+                /*
+                 * Set non-blocking mode for socket
+                 * fcntl = "file control", get/modify properties of file descriptor
+                 * nonblock -> on read() and write()
+                 */
+                int flags = fcntl(client_fd, F_GETFL, 0);
+                if (flags < 0 || fcntl(client_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+                    perror("fcntl failed");
+                    close(client_fd);
+                    continue;
+                }
+
+                // Store socket to poll array
                 if (nfds < MAX_CLIENTS) {
                     pollfds[nfds].fd = client_fd;
                     pollfds[nfds].events = POLLIN;
@@ -254,6 +269,7 @@ int main(void) {
                     printf("Too many clients, dropping request\n");
                     close(client_fd);
                 }
+
                 continue;
             }
 
@@ -397,7 +413,11 @@ int read_request(int fd, request_t* req) {
 
         if (n < 0) {
             if (errno == EINTR) continue;
-            else goto err_cleanup;
+
+            // No more data available right now
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+
+            goto err_cleanup;
         }
         if (n == 0) break;
 
@@ -451,7 +471,6 @@ int read_request(int fd, request_t* req) {
     req->headers_len = headers_len;
 
     // Save body
-    body_len = total - (headers_end + 4 - buffer);
     if (has_content_len) {
         if (body_len < 0 || body_len != content_len) goto err_cleanup;
 
