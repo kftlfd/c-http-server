@@ -12,7 +12,7 @@
 
 #define PORT 8080       // Port the server will listen on
 #define BACKLOG 10      // Max number of pending connections
-#define MAX_CLIENTS 10 // Max number of active connections
+#define MAX_CLIENTS 10  // Max number of active connections
 #define MAX_REQUEST_SIZE (1024 * 1024) // 1 MB
 
 typedef enum ClientState {
@@ -53,6 +53,10 @@ int read_request(int fd, request_t* req);
 void free_req(request_t req);
 int write_all(int fd, const char* buf, int len);
 
+// ----------------------------------------------
+// Signal handlers
+// ----------------------------------------------
+
 /*
  * Global flag for graceful shutdown.
  *
@@ -75,9 +79,56 @@ void signal_handler(int signum) {
     keep_running = 0; // stop the main loop
 }
 
-int main(void) {
-    int server_fd;
+void setup_signal_handlers() {
+    /*
+     * Set up signal handlers for graceful shutdown
+     *
+     * SIGINT:  Sent when user presses Ctrl+C
+     * SIGTERM: Sent by kill command (default for docker stop, etc.)
+     *
+     * When either signal is received, signal_handler sets
+     * keep_running to 0, causing the main loop to exit.
+     *
+     *
+     * Why not just signal()?
+     * signal(SIGINT, signal_handler);
+     * signal(SIGTERM, signal_handler);
+     *  - signal() may restart syscalls like poll()/accept()
+     *  - sigaction() gives precise control
+     *
+     * We intentionally DO NOT use SA_RESTART
+     * so that poll() returns when interrupted by SIGINT.
+     */
+    struct sigaction sa;
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);  // no additional signals blocked
+    sa.sa_flags = 0;           // DO NOT use SA_RESTART
+    if (sigaction(SIGINT, &sa, NULL) < 0 || sigaction(SIGTERM, &sa, NULL) < 0) {
+        perror("sigaction failed: SIGINT | SIGTERM");
+        exit(EXIT_FAILURE);
+    }
 
+    /*
+     * If client closes connection / crashed / reset the socket
+     * during sending response with `write()` -> kernel may send SIGPIPE
+     * by default it terminates the process immediately
+     * ignore it instead
+     */
+    struct sigaction sa_pipe;
+    sa_pipe.sa_handler = SIG_IGN;
+    sigemptyset(&sa_pipe.sa_mask);
+    sa_pipe.sa_flags = 0;
+    if (sigaction(SIGPIPE, &sa_pipe, NULL) < 0) {
+        perror("sigaction failed: SIGPIPE");
+        exit(EXIT_FAILURE);
+    }
+}
+
+// ----------------------------------------------
+// Server setup
+// ----------------------------------------------
+
+int setup_server() {
     /*
      * STEP 1: Create a socket
      *
@@ -87,7 +138,7 @@ int main(void) {
      * SOCK_STREAM -> TCP (reliable, connection-based)
      * 0           -> automatically select protocol (TCP)
      */
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         perror("socket failed");
         exit(EXIT_FAILURE);
@@ -150,41 +201,13 @@ int main(void) {
 
     printf("Server is listening on port %d...\n", PORT);
 
-    /*
-     * STEP 5: Set up signal handlers for graceful shutdown
-     *
-     * SIGINT:  Sent when user presses Ctrl+C
-     * SIGTERM: Sent by kill command (default for docker stop, etc.)
-     *
-     * When either signal is received, signal_handler sets
-     * keep_running to 0, causing the main loop to exit.
-     *
-     *
-     * Why not just signal()?
-     * signal(SIGINT, signal_handler);
-     * signal(SIGTERM, signal_handler);
-     *  - signal() may restart syscalls like poll()/accept()
-     *  - sigaction() gives precise control
-     *
-     * We intentionally DO NOT use SA_RESTART
-     * so that poll() returns when interrupted by SIGINT.
-     */
-    struct sigaction sa;
-    sa.sa_handler = signal_handler;
-    sigemptyset(&sa.sa_mask);  // no additional signals blocked
-    sa.sa_flags = 0;           // DO NOT use SA_RESTART
-    if (sigaction(SIGINT, &sa, NULL) < 0 || sigaction(SIGTERM, &sa, NULL) < 0) {
-        perror("sigaction failed");
-        exit(EXIT_FAILURE);
-    }
+    return server_fd;
+}
 
-    /*
-     * If client closes connection / crashed / reset the socket
-     * during sending response with `write()` -> kernel may send SIGPIPE
-     * by default it terminates the process immediately
-     * ignore it instead
-     */
-    signal(SIGPIPE, SIG_IGN);
+int main(void) {
+    setup_signal_handlers();
+
+    int server_fd = setup_server();
 
     /*
      * At this point, the server is ready to accept connections.
@@ -201,11 +224,11 @@ int main(void) {
       *   events  -> what we want to watch (e.g., POLLIN)
       *   revents -> what actually happened
       */
-    struct pollfd pollfds[MAX_CLIENTS + 1];
+    struct pollfd pfds[MAX_CLIENTS + 1];
 
     // Index 0 is always the server socket
-    pollfds[0].fd = server_fd;
-    pollfds[0].events = POLLIN;
+    pfds[0].fd = server_fd;
+    pfds[0].events = POLLIN;
 
     int nfds = 1;  // number of active fds
 
@@ -230,35 +253,32 @@ int main(void) {
          *   not return until a connection arrives. Using poll() first
          *   ensures we check the keep_running flag when the signal arrives.
          */
-        if (poll(pollfds, nfds, -1) < 0) { // -1 = infinite timeout
+        if (poll(pfds, nfds, -1) < 0) { // -1 = infinite timeout
             /*
              * EINTR: A signal interrupted the poll() call.
              * This happens when SIGINT/SIGTERM is received.
              * Break out of the loop to allow graceful shutdown.
              */
-            if (errno == EINTR) {
-                break;
-            }
-            perror("poll");
+            if (errno != EINTR) perror("poll");
             break;
         }
 
         // Check all file descriptors
         for (int i = 0; i < nfds; i++) {
-            if (pollfds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-                close(pollfds[i].fd);
-                pollfds[i] = pollfds[nfds - 1];
+            if (pfds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                close(pfds[i].fd);
+                pfds[i] = pfds[nfds - 1];
                 nfds--;
                 i--;
                 continue;
             }
 
-            if (!(pollfds[i].revents & POLLIN)) {
+            if (!(pfds[i].revents & POLLIN)) {
                 continue;
             }
 
             // New incoming connection
-            if (pollfds[i].fd == server_fd) {
+            if (pfds[i].fd == server_fd) {
                 /*
                  * What accept() does
                  *  1. Takes one connection from the queue
@@ -293,8 +313,8 @@ int main(void) {
 
                 // Store socket to poll array
                 if (nfds < MAX_CLIENTS) {
-                    pollfds[nfds].fd = client_fd;
-                    pollfds[nfds].events = POLLIN;
+                    pfds[nfds].fd = client_fd;
+                    pfds[nfds].events = POLLIN;
                     nfds++;
                 }
                 else {
@@ -306,7 +326,7 @@ int main(void) {
             }
 
             // Existing client sent data
-            int client_fd = pollfds[i].fd;
+            int client_fd = pfds[i].fd;
 
             /*
              * After accept
@@ -320,7 +340,7 @@ int main(void) {
             close(client_fd);
 
             // Remove fd from poll list
-            pollfds[i] = pollfds[nfds - 1];
+            pfds[i] = pfds[nfds - 1];
             nfds--;
             i--;
         }
@@ -335,7 +355,7 @@ int main(void) {
      */
     printf("Shutting down server...\n");
     for (int i = 0; i < nfds; i++) {
-        close(pollfds[i].fd);
+        close(pfds[i].fd);
     }
     printf("Server shutdown.\n");
 
