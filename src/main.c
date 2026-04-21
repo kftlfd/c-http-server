@@ -24,19 +24,20 @@ typedef enum ClientState {
 
 typedef struct Client {
     int fd;
-
     client_state_t state;
 
     char* buffer;
     int buffer_len;
     int buffer_cap;
 
+    char* body;
+
     int headers_done;
     int content_len;
 
-    int response_sent;
     char* response;
     int response_len;
+    int response_sent;
 } client_t;
 
 typedef struct Request {
@@ -47,6 +48,8 @@ typedef struct Request {
     char* headers;
     char* body;
 } request_t;
+
+typedef struct pollfd pollfd_t;
 
 void handle_client(int client_fd);
 int read_request(int fd, request_t* req);
@@ -204,19 +207,127 @@ int setup_server() {
     return server_fd;
 }
 
+// ----------------------------------------------
+// Main loop
+// ----------------------------------------------
+
+/**
+ * Set non-blocking mode for socket
+ */
+int set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+/**
+ * Close client helper: close client socket, update sockets and clients arrays
+ */
+void close_client(pollfd_t* pfds, client_t* clients, int* nfds, int i) {
+    close(pfds[i].fd);
+
+    pfds[i] = pfds[(*nfds) - 1];
+    clients[i] = clients[(*nfds) - 1];
+
+    (*nfds)--;
+}
+
+/**
+ * Read request from client socket
+ * handles partial reads and interrupts
+ */
+void handle_read(client_t* client) {
+    while (1) {
+        // grow buffer if needed
+        if (client->buffer_len + 1 > client->buffer_cap) {
+            if (client->buffer_cap * 2 > MAX_REQUEST_SIZE) {
+                client->state = STATE_ERROR;
+                return;
+            }
+            client->buffer_cap *= 2;
+            char* tmp = realloc(client->buffer, client->buffer_cap);
+            if (tmp == NULL) {
+                client->state = STATE_ERROR;
+                return;
+            }
+            client->buffer = tmp;
+        }
+
+        // read next bytes
+        size_t n = read(
+            client->fd,
+            client->buffer + client->buffer_len,
+            client->buffer_cap - client->buffer_len
+        );
+
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            else if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            else {
+                client->state = STATE_ERROR;
+                return;
+            }
+        }
+
+        if (n == 0) {
+            client->state = STATE_WRITING;
+            return;
+        }
+
+        client->buffer_len += n;
+
+        // check headers end
+        if (!client->headers_done) {
+            char* body = strstr(client->buffer, "\r\n\r\n");
+            if (body != NULL) {
+                client->headers_done = 1;
+                client->body = body + 4;
+            }
+        }
+    }
+}
+
+/**
+ * Write response to client socket
+ * handles partial writes and interrupts
+ */
+void handle_write(client_t* client) {
+    while (client->response_sent < client->response_len) {
+        // write next bytes
+        ssize_t n = write(
+            client->fd,
+            client->response + client->response_sent,
+            client->response_len - client->response_sent
+        );
+
+        if (n <= 0) {
+            if (errno == EINTR) continue;
+            else if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+            else {
+                client->state = STATE_ERROR;
+                return;
+            }
+        }
+
+        client->response_sent += n;
+    }
+
+    client->state = STATE_DONE;
+}
+
 int main(void) {
     setup_signal_handlers();
 
     int server_fd = setup_server();
 
-    /*
+    /**
      * At this point, the server is ready to accept connections.
      * Next step would be:
      *   accept()
      * to handle incoming clients.
      */
 
-     /*
+     /**
       * poll() setup
       *
       * pollfd structure:
@@ -224,7 +335,8 @@ int main(void) {
       *   events  -> what we want to watch (e.g., POLLIN)
       *   revents -> what actually happened
       */
-    struct pollfd pfds[MAX_CLIENTS + 1];
+    pollfd_t pfds[MAX_CLIENTS + 1];
+    client_t clients[MAX_CLIENTS + 1];
 
     // Index 0 is always the server socket
     pfds[0].fd = server_fd;
