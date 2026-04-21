@@ -15,6 +15,30 @@
 #define MAX_CLIENTS 10 // Max number of active connections
 #define MAX_REQUEST_SIZE (1024 * 1024) // 1 MB
 
+typedef enum ClientState {
+    STATE_READING,
+    STATE_WRITING,
+    STATE_DONE,
+    STATE_ERROR
+} client_state_t;
+
+typedef struct Client {
+    int fd;
+
+    client_state_t state;
+
+    char* buffer;
+    int buffer_len;
+    int buffer_cap;
+
+    int headers_done;
+    int content_len;
+
+    int response_sent;
+    char* response;
+    int response_len;
+} client_t;
+
 typedef struct Request {
     int headers_len;
     int body_len;
