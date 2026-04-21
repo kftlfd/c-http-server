@@ -17,14 +17,16 @@
 
 typedef enum ClientState {
     STATE_READING,
+    STATE_HANDLING,
     STATE_WRITING,
     STATE_DONE,
     STATE_ERROR
 } client_state_t;
 
 typedef struct Client {
-    int fd;
     client_state_t state;
+    int fd;
+    struct sockaddr_in addr;
 
     char* buffer;
     int buffer_len;
@@ -33,6 +35,7 @@ typedef struct Client {
     char* body;
 
     int headers_done;
+    int has_content_len;
     int content_len;
 
     char* response;
@@ -50,11 +53,6 @@ typedef struct Request {
 } request_t;
 
 typedef struct pollfd pollfd_t;
-
-void handle_client(int client_fd);
-int read_request(int fd, request_t* req);
-void free_req(request_t req);
-int write_all(int fd, const char* buf, int len);
 
 // ----------------------------------------------
 // Signal handlers
@@ -208,16 +206,29 @@ int setup_server() {
 }
 
 // ----------------------------------------------
-// Main loop
+// Main loop helpers
 // ----------------------------------------------
 
 /**
  * Set non-blocking mode for socket
  */
 int set_nonblocking(int fd) {
+    /**
+     * Set non-blocking mode for socket
+     * fcntl = "file control", get/modify properties of file descriptor
+     * nonblock -> on read() and write()
+     */
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0) return -1;
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+/**
+ * Free allocated memory for client
+ */
+void free_client(client_t* client) {
+    free(client->buffer);
+    free(client->response);
 }
 
 /**
@@ -225,12 +236,17 @@ int set_nonblocking(int fd) {
  */
 void close_client(pollfd_t* pfds, client_t* clients, int* nfds, int i) {
     close(pfds[i].fd);
+    free_client(clients + i);
 
     pfds[i] = pfds[(*nfds) - 1];
     clients[i] = clients[(*nfds) - 1];
 
     (*nfds)--;
 }
+
+// ----------------------------------------------
+// Read request
+// ----------------------------------------------
 
 /**
  * Read request from client socket
@@ -254,10 +270,14 @@ void handle_read(client_t* client) {
         }
 
         // read next bytes
+        size_t read_bytes = client->buffer_cap - client->buffer_len;
+        if (client->has_content_len) {
+            read_bytes = (size_t)(client->body + client->content_len) - (size_t)client->buffer_len;
+        }
         size_t n = read(
             client->fd,
             client->buffer + client->buffer_len,
-            client->buffer_cap - client->buffer_len
+            read_bytes
         );
 
         if (n < 0) {
@@ -270,7 +290,21 @@ void handle_read(client_t* client) {
         }
 
         if (n == 0) {
-            client->state = STATE_WRITING;
+            client->state = STATE_HANDLING;
+
+            char* buf = malloc(sizeof(char) * (client->buffer_len + 1));
+            if (buf != NULL) {
+                memcpy(buf, client->buffer, client->buffer_len);
+                buf[client->buffer_len] = '\0';
+                printf(
+                    "---\n"
+                    "%s\n"
+                    "---\n",
+                    buf
+                );
+                free(buf);
+            }
+
             return;
         }
 
@@ -282,10 +316,71 @@ void handle_read(client_t* client) {
             if (body != NULL) {
                 client->headers_done = 1;
                 client->body = body + 4;
+
+                // Parse Content-Length
+                char* cl = strstr(client->buffer, "Content-Length:");
+                if (cl != NULL) {
+                    sscanf(cl, "Content-Length: %d", &client->content_len);
+                    if (client->content_len < 0 || client->content_len > MAX_REQUEST_SIZE) {
+                        client->state = STATE_ERROR;
+                        return;
+                    };
+                    client->has_content_len = 1;
+                }
             }
         }
     }
 }
+
+// ----------------------------------------------
+// Create response
+// ----------------------------------------------
+
+void handle_request(client_t* client) {
+    /**
+     * Create echo response
+     */
+
+    int body_len = (client->buffer + client->buffer_len) - client->body;
+
+    if (body_len > INT_MAX - 4096) {
+        client->state = STATE_ERROR;
+        return;
+    }
+
+    int response_cap = 4096 + body_len;
+    client->response = malloc(sizeof(char) * response_cap);
+
+    if (client->response == NULL) {
+        perror("allocate response");
+        client->state = STATE_ERROR;
+        return;
+    }
+
+    int response_length = snprintf(
+        client->response,
+        response_cap,
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: %d\r\n"
+        "\r\n"
+        "%s",
+        body_len,
+        client->body
+    );
+
+    if (response_length < 0 || response_length >= response_cap) {
+        fprintf(stderr, "write response: sprintf failed or truncated\n");
+        client->state = STATE_ERROR;
+        return;
+    }
+
+    client->state = STATE_WRITING;
+}
+
+// ----------------------------------------------
+// Send response
+// ----------------------------------------------
 
 /**
  * Write response to client socket
@@ -315,7 +410,11 @@ void handle_write(client_t* client) {
     client->state = STATE_DONE;
 }
 
-int main(void) {
+// ----------------------------------------------
+// Main loop
+// ----------------------------------------------
+
+void init_server_event_loop() {
     setup_signal_handlers();
 
     int server_fd = setup_server();
@@ -377,21 +476,14 @@ int main(void) {
 
         // Check all file descriptors
         for (int i = 0; i < nfds; i++) {
-            if (pfds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-                close(pfds[i].fd);
-                pfds[i] = pfds[nfds - 1];
-                nfds--;
-                i--;
-                continue;
-            }
+            if (pfds[i].revents == 0) continue;
 
-            if (!(pfds[i].revents & POLLIN)) {
-                continue;
-            }
-
-            // New incoming connection
+            /**
+             * New incoming connection
+             */
             if (pfds[i].fd == server_fd) {
-                /*
+                printf("new connection\n");
+                /**
                  * What accept() does
                  *  1. Takes one connection from the queue
                  *  2. Creates a new socket (client_fd)
@@ -399,62 +491,106 @@ int main(void) {
                  *
                  * Important behavior: Blocking call by default → waits until a client connects
                  */
-                struct sockaddr_in client_addr;
-                memset(&client_addr, 0, sizeof(client_addr));
-                socklen_t client_len = sizeof(client_addr);
-                int client_fd = accept(server_fd,
+                struct sockaddr_in client_addr = { 0 };
+                socklen_t client_addr_len = sizeof(client_addr);
+                int client_fd = accept(
+                    server_fd,
                     (struct sockaddr*)&client_addr,
-                    &client_len);
+                    &client_addr_len
+                );
                 if (client_fd < 0) {
-                    if (errno == EINTR) continue;
-                    perror("accept");
-                    continue; // don't kill server, just try again, go to next connection
+                    if (errno != EINTR) perror("accept");
+                    continue; // don't kill server, go to next connection
                 }
 
-                /*
-                 * Set non-blocking mode for socket
-                 * fcntl = "file control", get/modify properties of file descriptor
-                 * nonblock -> on read() and write()
-                 */
-                int flags = fcntl(client_fd, F_GETFL, 0);
-                if (flags < 0 || fcntl(client_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+                if (set_nonblocking(client_fd) < 0) {
                     perror("fcntl failed");
                     close(client_fd);
                     continue;
                 }
 
-                // Store socket to poll array
-                if (nfds < MAX_CLIENTS) {
-                    pfds[nfds].fd = client_fd;
-                    pfds[nfds].events = POLLIN;
-                    nfds++;
-                }
-                else {
-                    printf("Too many clients, dropping request\n");
+                if (nfds >= MAX_CLIENTS) {
+                    printf("Too many clients, dropping connection\n");
                     close(client_fd);
+                    continue;
                 }
+
+                int buffer_cap = 4096;
+                char* buffer = malloc(sizeof(char) * buffer_cap);
+                if (buffer == NULL) {
+                    printf("Failed to allocate request buffer\n");
+                    close(client_fd);
+                    continue;
+                }
+
+                pfds[nfds].fd = client_fd;
+                pfds[nfds].events = POLLIN;
+
+                clients[nfds].state = STATE_READING;
+                clients[nfds].fd = client_fd;
+                clients[nfds].addr = client_addr;
+                clients[nfds].buffer = buffer;
+                clients[nfds].buffer_len = 0;
+                clients[nfds].buffer_cap = buffer_cap;
+                clients[nfds].body = NULL;
+                clients[nfds].headers_done = 0;
+                clients[nfds].has_content_len = 0;
+                clients[nfds].content_len = 0;
+                clients[nfds].response = NULL;
+                clients[nfds].response_len = 0;
+                clients[nfds].response_sent = 0;
 
                 continue;
             }
 
-            // Existing client sent data
-            int client_fd = pfds[i].fd;
+            /**
+             * Socket error
+             */
+            if (pfds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                printf("socket error\n");
+                close_client(pfds, clients, &nfds, i);
+                i--;
+                continue;
+            }
 
-            /*
+            /**
+             * Client read/write ready
+             *
              * After accept
              *  - read from client_fd
              *  - write to client_fd
              *  - close client_fd when done
              */
+            printf("client ready\n");
 
-            handle_client(client_fd);
+            client_t client = clients[i];
 
-            close(client_fd);
+            if (client.state == STATE_READING && (pfds[i].revents & POLLIN)) {
+                printf("client read\n");
+                handle_read(&client);
+                continue;
+            }
 
-            // Remove fd from poll list
-            pfds[i] = pfds[nfds - 1];
-            nfds--;
-            i--;
+            if (client.state == STATE_HANDLING) {
+                printf("client handle\n");
+                handle_request(&client);
+                continue;
+            }
+
+            if (client.state == STATE_WRITING) {
+                pfds[i].events = POLLOUT;
+                if (pfds[i].revents & POLLOUT) {
+                    printf("client write\n");
+                    handle_write(&client);
+                }
+                continue;
+            }
+
+            if (client.state == STATE_DONE || client.state == STATE_ERROR) {
+                close_client(pfds, clients, &nfds, i);
+                i--;
+                continue;
+            }
         }
     }
 
@@ -468,222 +604,12 @@ int main(void) {
     printf("Shutting down server...\n");
     for (int i = 0; i < nfds; i++) {
         close(pfds[i].fd);
+        free_client(clients + i);
     }
     printf("Server shutdown.\n");
-
-    return 0;
 }
 
-void handle_client(int client_fd) {
-    // Read request
-    request_t req;
-    memset(&req, 0, sizeof(req));
-    if (read_request(client_fd, &req) < 0) {
-        perror("read request");
-        return;
-    }
-
-    printf(
-        "---\n"
-        "Received request: %s %s\n\n"
-        "%s\n\n"
-        "%s\n"
-        "---\n",
-        req.method, req.path,
-        req.headers, req.body
-    );
-
-    // Create echo response
-    if (req.body_len > INT_MAX - 4096) {
-        free_req(req);
-        return;
-    }
-
-    int response_cap = 4096 + req.body_len;
-    char* response = malloc(sizeof(char) * response_cap);
-
-    if (response == NULL) {
-        perror("allocate response");
-        free_req(req);
-        return;
-    }
-
-    int response_length = snprintf(
-        response,
-        response_cap,
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/plain\r\n"
-        "Content-Length: %d\r\n"
-        "\r\n"
-        "%s",
-        req.body_len,
-        req.body
-    );
-    if (response_length < 0 || response_length >= response_cap) {
-        fprintf(stderr, "write response: sprintf failed or truncated\n");
-        free(response);
-        free_req(req);
-        return;
-    }
-
-    // Send response
-    if (write_all(client_fd, response, response_length) < 0) {
-        perror("send response");
-    }
-
-    free(response);
-    free_req(req);
-}
-
-/*
- * read request from socket (handles partial reads)
- */
-int read_request(int fd, request_t* req) {
-    if (req == NULL) {
-        return -1;
-    }
-    /*
-     * Read until:
-     * - hheaders are complete ("\r\n\r\n")
-     * - AND full body is read (via Content-Length)
-     */
-
-    int capacity = 4096;
-    int total = 0;
-    char* buffer = malloc(capacity);
-    if (buffer == NULL) return -1;
-
-    int headers_done = 0;
-    int content_len = 0;
-    int has_content_len = 0;
-
-    char* headers_end = NULL;
-
-    char* headers = NULL;
-    int headers_len = 0;
-
-    char* body = NULL;
-    int body_len = 0;
-
-    while (1) {
-        if (total + 1 >= capacity) {
-            capacity *= 2;
-            char* tmp = realloc(buffer, capacity);
-            if (tmp == NULL) goto err_cleanup;
-            buffer = tmp;
-        }
-
-        ssize_t n = read(fd, buffer + total, capacity - total);
-
-        if (n < 0) {
-            if (errno == EINTR) continue;
-
-            // No more data available right now
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-
-            goto err_cleanup;
-        }
-        if (n == 0) break;
-
-        total += n;
-        if (total > MAX_REQUEST_SIZE) goto err_cleanup;
-
-        buffer[total] = '\0';
-
-        // Detect end of headers
-        if (!headers_done) {
-            headers_end = strstr(buffer, "\r\n\r\n");
-            if (headers_end != NULL) {
-                headers_done = 1;
-
-                // Save headers
-                headers_len = headers_end - buffer + 4;
-                headers = malloc(sizeof(char) * headers_len);
-                if (headers == NULL) goto err_cleanup;
-
-                memcpy(headers, buffer, headers_len - 1);
-                headers[headers_len - 1] = '\0';
-
-                // Parse Content-Length
-                char* cl = strstr(buffer, "Content-Length:");
-                if (cl != NULL) {
-                    has_content_len = 1;
-                    if (sscanf(cl, "Content-Length: %d", &content_len) != 1) goto err_cleanup;
-                    if (content_len < 0 || content_len > MAX_REQUEST_SIZE) goto err_cleanup;
-                }
-            }
-        }
-
-        if (headers_done) {
-            body_len = total - (headers_end + 4 - buffer);
-
-            if (body_len >= content_len) {
-                break;
-            }
-        }
-    }
-
-    if (total <= 0 || headers_end == NULL) goto err_cleanup;
-
-    // Parse request line
-    memset(req->method, 0, sizeof(req->method));
-    memset(req->path, 0, sizeof(req->path));
-    if (sscanf(headers, "%7s %1023s", req->method, req->path) != 2) goto err_cleanup;
-
-    // Save headers
-    req->headers = headers;
-    req->headers_len = headers_len;
-
-    // Save body
-    if (has_content_len) {
-        if (body_len < 0 || body_len != content_len) goto err_cleanup;
-
-        body = malloc(sizeof(char) * (body_len + 1));
-        if (body == NULL) goto err_cleanup;
-
-        memcpy(body, headers_end + 4, body_len);
-        body[body_len] = '\0';
-
-        req->body_len = body_len;
-        req->body = body;
-    }
-    else if (body_len > 0) {
-        goto err_cleanup;
-    }
-
-    free(buffer);
-    return 1;
-
-err_cleanup:
-    free(buffer);
-    free(headers);
-    free(body);
-    return -1;
-}
-
-void free_req(request_t req) {
-    free(req.headers);
-    free(req.body);
-}
-
-/*
- * write all bytes to socket (handles partial writes)
- */
-int write_all(int fd, const char* buf, int len) {
-    /*
-     * write() may not send all bytes in one call (partial write).
-     * Loop until all bytes are sent.
-     */
-    int total = 0;
-
-    while (total < len) {
-        ssize_t n = write(fd, buf + total, len - total);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) {
-            return -1;
-        }
-        total += n;
-    }
-
+int main(void) {
+    init_server_event_loop();
     return 0;
 }
