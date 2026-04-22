@@ -343,10 +343,26 @@ void handle_read(client_t* client) {
         }
 
         // read next bytes
-        size_t read_bytes = client->buffer_cap - client->buffer_len;
-        // if (client->has_content_len) {
-        //     read_bytes = (size_t)(client->body + client->content_len) - (size_t)client->buffer_len;
-        // }
+        size_t read_bytes = client->buffer_cap - client->buffer_len; // room left in buffer
+
+        if (client->headers_done && client->has_content_len) {
+            // write position in buffer
+            char* write_pos = client->buffer + client->buffer_len;
+            // end of expected request = body start + declared content length
+            char* want_end = client->body + client->content_len;
+
+            if (want_end > write_pos) {
+                size_t remaining = want_end - write_pos;
+                if (remaining < read_bytes) read_bytes = remaining;
+            }
+            else {
+                // already have everything; shouldn't normally reach here because
+                // the previous iteration's check would have goto'd next_step,
+                // but just in case.
+                goto next_step;
+            }
+        }
+
         ssize_t n = read(
             client->fd,
             client->buffer + client->buffer_len,
@@ -408,18 +424,12 @@ void handle_read(client_t* client) {
     return;
 
 next_step:
-    char* buf = malloc(sizeof(char) * (client->buffer_len + 1));
-    if (buf != NULL) {
-        memcpy(buf, client->buffer, client->buffer_len);
-        buf[client->buffer_len] = '\0';
-        printf(
-            "---\n"
-            "%s\n"
-            "---\n",
-            buf
-        );
-        free(buf);
-    }
+    printf(
+        "---\n"
+        "%s\n"
+        "---\n",
+        client->buffer
+    );
 
     handle_request(client);
     client->state = STATE_WRITING;
