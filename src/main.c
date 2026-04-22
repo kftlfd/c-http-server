@@ -641,13 +641,12 @@ void init_server_event_loop() {
             if (client->state == STATE_READING && (pfds[i].revents & POLLIN)) {
                 printf("client read\n");
                 handle_read(client);
-                continue;
+                // fall through to DONE/ERROR check
             }
-
-            if (client->state == STATE_WRITING && (pfds[i].revents & POLLOUT)) {
+            else if (client->state == STATE_WRITING && (pfds[i].revents & POLLOUT)) {
                 printf("client write\n");
                 handle_write(client);
-                continue;
+                // fall through to DONE/ERROR check
             }
 
             if (client->state == STATE_DONE || client->state == STATE_ERROR) {
