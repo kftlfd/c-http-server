@@ -12,8 +12,35 @@
 
 #define PORT 8080       // Port the server will listen on
 #define BACKLOG 10      // Max number of pending connections
-#define MAX_CLIENTS 10 // Max number of active connections
+#define MAX_CLIENTS 10  // Max number of active connections
 #define MAX_REQUEST_SIZE (1024 * 1024) // 1 MB
+
+typedef enum ClientState {
+    STATE_READING,
+    STATE_WRITING,
+    STATE_DONE,
+    STATE_ERROR
+} client_state_t;
+
+typedef struct Client {
+    client_state_t state;
+    int fd;
+    struct sockaddr_in addr;
+
+    char* buffer;
+    int buffer_len;
+    int buffer_cap;
+
+    char* body;
+
+    int headers_done;
+    int has_content_len;
+    int content_len;
+
+    char* response;
+    int response_len;
+    int response_sent;
+} client_t;
 
 typedef struct Request {
     int headers_len;
@@ -24,10 +51,11 @@ typedef struct Request {
     char* body;
 } request_t;
 
-void handle_client(int client_fd);
-int read_request(int fd, request_t* req);
-void free_req(request_t req);
-int write_all(int fd, const char* buf, int len);
+typedef struct pollfd pollfd_t;
+
+// ----------------------------------------------
+// Signal handlers
+// ----------------------------------------------
 
 /*
  * Global flag for graceful shutdown.
@@ -51,9 +79,56 @@ void signal_handler(int signum) {
     keep_running = 0; // stop the main loop
 }
 
-int main(void) {
-    int server_fd;
+void setup_signal_handlers() {
+    /*
+     * Set up signal handlers for graceful shutdown
+     *
+     * SIGINT:  Sent when user presses Ctrl+C
+     * SIGTERM: Sent by kill command (default for docker stop, etc.)
+     *
+     * When either signal is received, signal_handler sets
+     * keep_running to 0, causing the main loop to exit.
+     *
+     *
+     * Why not just signal()?
+     * signal(SIGINT, signal_handler);
+     * signal(SIGTERM, signal_handler);
+     *  - signal() may restart syscalls like poll()/accept()
+     *  - sigaction() gives precise control
+     *
+     * We intentionally DO NOT use SA_RESTART
+     * so that poll() returns when interrupted by SIGINT.
+     */
+    struct sigaction sa;
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);  // no additional signals blocked
+    sa.sa_flags = 0;           // DO NOT use SA_RESTART
+    if (sigaction(SIGINT, &sa, NULL) < 0 || sigaction(SIGTERM, &sa, NULL) < 0) {
+        perror("sigaction failed: SIGINT | SIGTERM");
+        exit(EXIT_FAILURE);
+    }
 
+    /*
+     * If client closes connection / crashed / reset the socket
+     * during sending response with `write()` -> kernel may send SIGPIPE
+     * by default it terminates the process immediately
+     * ignore it instead
+     */
+    struct sigaction sa_pipe;
+    sa_pipe.sa_handler = SIG_IGN;
+    sigemptyset(&sa_pipe.sa_mask);
+    sa_pipe.sa_flags = 0;
+    if (sigaction(SIGPIPE, &sa_pipe, NULL) < 0) {
+        perror("sigaction failed: SIGPIPE");
+        exit(EXIT_FAILURE);
+    }
+}
+
+// ----------------------------------------------
+// Server setup
+// ----------------------------------------------
+
+int setup_server() {
     /*
      * STEP 1: Create a socket
      *
@@ -63,7 +138,7 @@ int main(void) {
      * SOCK_STREAM -> TCP (reliable, connection-based)
      * 0           -> automatically select protocol (TCP)
      */
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         perror("socket failed");
         exit(EXIT_FAILURE);
@@ -126,50 +201,293 @@ int main(void) {
 
     printf("Server is listening on port %d...\n", PORT);
 
-    /*
-     * STEP 5: Set up signal handlers for graceful shutdown
-     *
-     * SIGINT:  Sent when user presses Ctrl+C
-     * SIGTERM: Sent by kill command (default for docker stop, etc.)
-     *
-     * When either signal is received, signal_handler sets
-     * keep_running to 0, causing the main loop to exit.
-     *
-     *
-     * Why not just signal()?
-     * signal(SIGINT, signal_handler);
-     * signal(SIGTERM, signal_handler);
-     *  - signal() may restart syscalls like poll()/accept()
-     *  - sigaction() gives precise control
-     *
-     * We intentionally DO NOT use SA_RESTART
-     * so that poll() returns when interrupted by SIGINT.
+    return server_fd;
+}
+
+// ----------------------------------------------
+// Main loop helpers
+// ----------------------------------------------
+
+/**
+ * Set non-blocking mode for socket
+ */
+int set_nonblocking(int fd) {
+    /**
+     * Set non-blocking mode for socket
+     * fcntl = "file control", get/modify properties of file descriptor
+     * nonblock -> on read() and write()
      */
-    struct sigaction sa;
-    sa.sa_handler = signal_handler;
-    sigemptyset(&sa.sa_mask);  // no additional signals blocked
-    sa.sa_flags = 0;           // DO NOT use SA_RESTART
-    if (sigaction(SIGINT, &sa, NULL) < 0 || sigaction(SIGTERM, &sa, NULL) < 0) {
-        perror("sigaction failed");
-        exit(EXIT_FAILURE);
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+/**
+ * Free allocated memory for client
+ */
+void free_client(client_t* client) {
+    if (client->buffer != NULL) {
+        free(client->buffer);
+        client->buffer = NULL;
+        client->body = NULL;
+    }
+    if (client->response != NULL) {
+        free(client->response);
+        client->response = NULL;
+    }
+}
+
+/**
+ * Close client helper: close client socket, update sockets and clients arrays
+ */
+void close_client(pollfd_t* pfds, client_t* clients, int* nfds, int i) {
+    close(pfds[i].fd);
+    free_client(clients + i);
+
+    pfds[i] = pfds[(*nfds) - 1];
+    clients[i] = clients[(*nfds) - 1];
+
+    (*nfds)--;
+}
+
+// ----------------------------------------------
+// Create response
+// ----------------------------------------------
+
+void handle_request(client_t* client) {
+    /**
+     * Create echo response
+     */
+
+    if (client->body == NULL) {
+        client->response = malloc(1024);
+        if (client->response == NULL) {
+            client->state = STATE_ERROR;
+            return;
+        }
+        client->response_len = snprintf(
+            client->response,
+            1024,
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain\r\n"
+            "Content-Length: %d\r\n\r\n",
+            0
+        );
+
+        if (client->response_len < 0) {
+            fprintf(stderr, "write response: sprintf failed or truncated\n");
+            client->state = STATE_ERROR;
+            return;
+        }
+
+        return;
     }
 
-    /*
-     * If client closes connection / crashed / reset the socket
-     * during sending response with `write()` -> kernel may send SIGPIPE
-     * by default it terminates the process immediately
-     * ignore it instead
-     */
-    signal(SIGPIPE, SIG_IGN);
+    int body_len = (client->buffer + client->buffer_len) - client->body;
 
-    /*
+    if (body_len > INT_MAX - 4096) {
+        client->state = STATE_ERROR;
+        return;
+    }
+
+    int response_cap = 4096 + body_len;
+    client->response = malloc(sizeof(char) * response_cap);
+
+    if (client->response == NULL) {
+        perror("allocate response");
+        client->state = STATE_ERROR;
+        return;
+    }
+
+    client->response_len = snprintf(
+        client->response,
+        response_cap,
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "%s",
+        body_len,
+        client->body
+    );
+
+    if (client->response_len < 0 || client->response_len >= response_cap) {
+        fprintf(stderr, "write response: sprintf failed or truncated\n");
+        client->state = STATE_ERROR;
+        return;
+    }
+}
+
+// ----------------------------------------------
+// Read request
+// ----------------------------------------------
+
+/**
+ * Read request from client socket
+ * handles partial reads and interrupts
+ */
+void handle_read(client_t* client) {
+    while (1) {
+        // grow buffer if needed
+        if (client->buffer_len + 1 > client->buffer_cap) {
+            if (client->buffer_cap >= MAX_REQUEST_SIZE / 2) {
+                client->state = STATE_ERROR;
+                return;
+            }
+            client->buffer_cap *= 2;
+            char* tmp = realloc(client->buffer, client->buffer_cap);
+            if (tmp == NULL) {
+                client->state = STATE_ERROR;
+                return;
+            }
+            client->buffer = tmp;
+        }
+
+        // read next bytes
+        size_t read_bytes = client->buffer_cap - client->buffer_len; // room left in buffer
+
+        if (client->headers_done && client->has_content_len) {
+            // write position in buffer
+            char* write_pos = client->buffer + client->buffer_len;
+            // end of expected request = body start + declared content length
+            char* want_end = client->body + client->content_len;
+
+            if (want_end > write_pos) {
+                size_t remaining = want_end - write_pos;
+                if (remaining < read_bytes) read_bytes = remaining;
+            }
+            else {
+                // already have everything; shouldn't normally reach here because
+                // the previous iteration's check would have goto'd next_step,
+                // but just in case.
+                goto next_step;
+            }
+        }
+
+        ssize_t n = read(
+            client->fd,
+            client->buffer + client->buffer_len,
+            read_bytes
+        );
+
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            else if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            else {
+                client->state = STATE_ERROR;
+                return;
+            }
+        }
+
+        if (n == 0) {
+            if (client->headers_done) goto next_step;
+            else {
+                client->state = STATE_ERROR;
+                return;
+            }
+        };
+
+        client->buffer_len += n;
+        client->buffer[client->buffer_len] = '\0';
+
+        // check headers end
+        if (!client->headers_done) {
+            char* body = strstr(client->buffer, "\r\n\r\n");
+            if (body != NULL) {
+                client->headers_done = 1;
+                client->body = body + 4;
+
+                // Parse Content-Length
+                char* cl = strstr(client->buffer, "Content-Length:");
+                if (cl != NULL) {
+                    int n = sscanf(cl, "Content-Length: %d", &client->content_len);
+                    if (n != 1 || client->content_len < 0 || client->content_len > MAX_REQUEST_SIZE) {
+                        client->state = STATE_ERROR;
+                        return;
+                    };
+                    client->has_content_len = 1;
+                }
+            }
+        }
+
+        if (client->headers_done) {
+            if (!client->has_content_len) {
+                goto next_step;
+            }
+
+            int body_received = (client->buffer + client->buffer_len) - client->body;
+
+            if (body_received >= client->content_len) {
+                goto next_step;
+            }
+        }
+    }
+    return;
+
+next_step:
+    printf(
+        "---\n"
+        "%.*s\n"
+        "---\n",
+        client->buffer_len,
+        client->buffer
+    );
+
+    handle_request(client);
+    client->state = STATE_WRITING;
+    return;
+}
+
+// ----------------------------------------------
+// Send response
+// ----------------------------------------------
+
+/**
+ * Write response to client socket
+ * handles partial writes and interrupts
+ */
+void handle_write(client_t* client) {
+    while (client->response_sent < client->response_len) {
+        // write next bytes
+        ssize_t n = write(
+            client->fd,
+            client->response + client->response_sent,
+            client->response_len - client->response_sent
+        );
+
+        if (n <= 0) {
+            if (errno == EINTR) continue;
+            else if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+            else {
+                client->state = STATE_ERROR;
+                return;
+            }
+        }
+
+        client->response_sent += n;
+    }
+
+    client->state = STATE_DONE;
+}
+
+// ----------------------------------------------
+// Main loop
+// ----------------------------------------------
+
+void init_server_event_loop() {
+    setup_signal_handlers();
+
+    int server_fd = setup_server();
+
+    /**
      * At this point, the server is ready to accept connections.
      * Next step would be:
      *   accept()
      * to handle incoming clients.
      */
 
-     /*
+     /**
       * poll() setup
       *
       * pollfd structure:
@@ -177,17 +495,29 @@ int main(void) {
       *   events  -> what we want to watch (e.g., POLLIN)
       *   revents -> what actually happened
       */
-    struct pollfd pollfds[MAX_CLIENTS + 1];
+    pollfd_t pfds[MAX_CLIENTS + 1];
+    client_t clients[MAX_CLIENTS + 1];
 
     // Index 0 is always the server socket
-    pollfds[0].fd = server_fd;
-    pollfds[0].events = POLLIN;
+    pfds[0].fd = server_fd;
+    pfds[0].events = POLLIN;
+
+    clients[0] = (client_t){ 0 };
 
     int nfds = 1;  // number of active fds
 
     while (keep_running) {
         // server_fd → listening socket (stays open)
         // client_fd → new socket for each client
+
+        pfds[0].events = POLLIN;
+        // Sync events with state
+        for (int i = 1; i < nfds; i++) {
+            client_t* client = &clients[i];
+            if (client->state == STATE_READING) pfds[i].events = POLLIN;
+            else if (client->state == STATE_WRITING) pfds[i].events = POLLOUT;
+            else pfds[i].events = 0;
+        }
 
         /*
          * Use poll() before accept() to allow signal interruption.
@@ -206,36 +536,28 @@ int main(void) {
          *   not return until a connection arrives. Using poll() first
          *   ensures we check the keep_running flag when the signal arrives.
          */
-        if (poll(pollfds, nfds, -1) < 0) { // -1 = infinite timeout
+        if (poll(pfds, nfds, -1) < 0) { // -1 = infinite timeout
             /*
              * EINTR: A signal interrupted the poll() call.
              * This happens when SIGINT/SIGTERM is received.
              * Break out of the loop to allow graceful shutdown.
              */
-            if (errno == EINTR) {
-                break;
-            }
-            perror("poll");
+            if (errno != EINTR) perror("poll");
             break;
         }
 
         // Check all file descriptors
         for (int i = 0; i < nfds; i++) {
-            if (pollfds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-                close(pollfds[i].fd);
-                pollfds[i] = pollfds[nfds - 1];
-                nfds--;
-                i--;
-                continue;
-            }
+            if (pfds[i].revents == 0) continue;
 
-            if (!(pollfds[i].revents & POLLIN)) {
-                continue;
-            }
+            /**
+             * New incoming connection
+             */
+            if (pfds[i].fd == server_fd) {
+                if (!(pfds[i].revents & POLLIN)) continue;
 
-            // New incoming connection
-            if (pollfds[i].fd == server_fd) {
-                /*
+                printf("new connection\n");
+                /**
                  * What accept() does
                  *  1. Takes one connection from the queue
                  *  2. Creates a new socket (client_fd)
@@ -243,62 +565,104 @@ int main(void) {
                  *
                  * Important behavior: Blocking call by default → waits until a client connects
                  */
-                struct sockaddr_in client_addr;
-                memset(&client_addr, 0, sizeof(client_addr));
-                socklen_t client_len = sizeof(client_addr);
-                int client_fd = accept(server_fd,
+                struct sockaddr_in client_addr = { 0 };
+                socklen_t client_addr_len = sizeof(client_addr);
+                int client_fd = accept(
+                    server_fd,
                     (struct sockaddr*)&client_addr,
-                    &client_len);
+                    &client_addr_len
+                );
                 if (client_fd < 0) {
-                    if (errno == EINTR) continue;
-                    perror("accept");
-                    continue; // don't kill server, just try again, go to next connection
+                    if (errno != EINTR) perror("accept");
+                    continue; // don't kill server, go to next connection
                 }
 
-                /*
-                 * Set non-blocking mode for socket
-                 * fcntl = "file control", get/modify properties of file descriptor
-                 * nonblock -> on read() and write()
-                 */
-                int flags = fcntl(client_fd, F_GETFL, 0);
-                if (flags < 0 || fcntl(client_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+                if (set_nonblocking(client_fd) < 0) {
                     perror("fcntl failed");
                     close(client_fd);
                     continue;
                 }
 
-                // Store socket to poll array
-                if (nfds < MAX_CLIENTS) {
-                    pollfds[nfds].fd = client_fd;
-                    pollfds[nfds].events = POLLIN;
-                    nfds++;
-                }
-                else {
-                    printf("Too many clients, dropping request\n");
+                if (nfds >= MAX_CLIENTS + 1) {
+                    printf("Too many clients, dropping connection\n");
                     close(client_fd);
+                    continue;
                 }
+
+                int buffer_cap = 4096;
+                char* buffer = malloc(sizeof(char) * buffer_cap);
+                if (buffer == NULL) {
+                    printf("Failed to allocate request buffer\n");
+                    close(client_fd);
+                    continue;
+                }
+
+                pfds[nfds].fd = client_fd;
+                pfds[nfds].events = POLLIN;
+
+                clients[nfds].state = STATE_READING;
+                clients[nfds].fd = client_fd;
+                clients[nfds].addr = client_addr;
+                clients[nfds].buffer = buffer;
+                clients[nfds].buffer_len = 0;
+                clients[nfds].buffer_cap = buffer_cap;
+                clients[nfds].body = NULL;
+                clients[nfds].headers_done = 0;
+                clients[nfds].has_content_len = 0;
+                clients[nfds].content_len = 0;
+                clients[nfds].response = NULL;
+                clients[nfds].response_len = 0;
+                clients[nfds].response_sent = 0;
+
+                nfds++;
 
                 continue;
             }
 
-            // Existing client sent data
-            int client_fd = pollfds[i].fd;
+            /**
+             * Socket error
+             */
+            if (pfds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                printf("socket error\n");
+                close_client(pfds, clients, &nfds, i);
+                i--;
+                continue;
+            }
 
-            /*
+            /**
+             * Client read/write ready
+             *
              * After accept
              *  - read from client_fd
              *  - write to client_fd
              *  - close client_fd when done
              */
+            printf("client ready\n");
 
-            handle_client(client_fd);
+            client_t* client = &clients[i];
 
-            close(client_fd);
+            if (client->state == STATE_READING && (pfds[i].revents & POLLIN)) {
+                printf("client read\n");
+                handle_read(client);
+                // fall through to DONE/ERROR check
+            }
+            else if (client->state == STATE_WRITING && (pfds[i].revents & POLLOUT)) {
+                printf("client write\n");
+                handle_write(client);
+                // fall through to DONE/ERROR check
+            }
 
-            // Remove fd from poll list
-            pollfds[i] = pollfds[nfds - 1];
-            nfds--;
-            i--;
+            if (client->state == STATE_DONE || client->state == STATE_ERROR) {
+                if (client->state == STATE_DONE) {
+                    printf("request done\n");
+                }
+                else {
+                    printf("request error\n");
+                }
+                close_client(pfds, clients, &nfds, i);
+                i--;
+                continue;
+            }
         }
     }
 
@@ -309,225 +673,15 @@ int main(void) {
      * This code is now reachable thanks to the graceful shutdown
      * mechanism (signal_handler + poll() + keep_running).
      */
-    printf("Shutting down server...\n");
+    printf("\nShutting down server...\n");
     for (int i = 0; i < nfds; i++) {
-        close(pollfds[i].fd);
+        close(pfds[i].fd);
+        free_client(clients + i);
     }
     printf("Server shutdown.\n");
-
-    return 0;
 }
 
-void handle_client(int client_fd) {
-    // Read request
-    request_t req;
-    memset(&req, 0, sizeof(req));
-    if (read_request(client_fd, &req) < 0) {
-        perror("read request");
-        return;
-    }
-
-    printf(
-        "---\n"
-        "Received request: %s %s\n\n"
-        "%s\n\n"
-        "%s\n"
-        "---\n",
-        req.method, req.path,
-        req.headers, req.body
-    );
-
-    // Create echo response
-    if (req.body_len > INT_MAX - 4096) {
-        free_req(req);
-        return;
-    }
-
-    int response_cap = 4096 + req.body_len;
-    char* response = malloc(sizeof(char) * response_cap);
-
-    if (response == NULL) {
-        perror("allocate response");
-        free_req(req);
-        return;
-    }
-
-    int response_length = snprintf(
-        response,
-        response_cap,
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/plain\r\n"
-        "Content-Length: %d\r\n"
-        "\r\n"
-        "%s",
-        req.body_len,
-        req.body
-    );
-    if (response_length < 0 || response_length >= response_cap) {
-        fprintf(stderr, "write response: sprintf failed or truncated\n");
-        free(response);
-        free_req(req);
-        return;
-    }
-
-    // Send response
-    if (write_all(client_fd, response, response_length) < 0) {
-        perror("send response");
-    }
-
-    free(response);
-    free_req(req);
-}
-
-/*
- * read request from socket (handles partial reads)
- */
-int read_request(int fd, request_t* req) {
-    if (req == NULL) {
-        return -1;
-    }
-    /*
-     * Read until:
-     * - hheaders are complete ("\r\n\r\n")
-     * - AND full body is read (via Content-Length)
-     */
-
-    int capacity = 4096;
-    int total = 0;
-    char* buffer = malloc(capacity);
-    if (buffer == NULL) return -1;
-
-    int headers_done = 0;
-    int content_len = 0;
-    int has_content_len = 0;
-
-    char* headers_end = NULL;
-
-    char* headers = NULL;
-    int headers_len = 0;
-
-    char* body = NULL;
-    int body_len = 0;
-
-    while (1) {
-        if (total + 1 >= capacity) {
-            capacity *= 2;
-            char* tmp = realloc(buffer, capacity);
-            if (tmp == NULL) goto err_cleanup;
-            buffer = tmp;
-        }
-
-        ssize_t n = read(fd, buffer + total, capacity - total);
-
-        if (n < 0) {
-            if (errno == EINTR) continue;
-
-            // No more data available right now
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-
-            goto err_cleanup;
-        }
-        if (n == 0) break;
-
-        total += n;
-        if (total > MAX_REQUEST_SIZE) goto err_cleanup;
-
-        buffer[total] = '\0';
-
-        // Detect end of headers
-        if (!headers_done) {
-            headers_end = strstr(buffer, "\r\n\r\n");
-            if (headers_end != NULL) {
-                headers_done = 1;
-
-                // Save headers
-                headers_len = headers_end - buffer + 4;
-                headers = malloc(sizeof(char) * headers_len);
-                if (headers == NULL) goto err_cleanup;
-
-                memcpy(headers, buffer, headers_len - 1);
-                headers[headers_len - 1] = '\0';
-
-                // Parse Content-Length
-                char* cl = strstr(buffer, "Content-Length:");
-                if (cl != NULL) {
-                    has_content_len = 1;
-                    if (sscanf(cl, "Content-Length: %d", &content_len) != 1) goto err_cleanup;
-                    if (content_len < 0 || content_len > MAX_REQUEST_SIZE) goto err_cleanup;
-                }
-            }
-        }
-
-        if (headers_done) {
-            body_len = total - (headers_end + 4 - buffer);
-
-            if (body_len >= content_len) {
-                break;
-            }
-        }
-    }
-
-    if (total <= 0 || headers_end == NULL) goto err_cleanup;
-
-    // Parse request line
-    memset(req->method, 0, sizeof(req->method));
-    memset(req->path, 0, sizeof(req->path));
-    if (sscanf(headers, "%7s %1023s", req->method, req->path) != 2) goto err_cleanup;
-
-    // Save headers
-    req->headers = headers;
-    req->headers_len = headers_len;
-
-    // Save body
-    if (has_content_len) {
-        if (body_len < 0 || body_len != content_len) goto err_cleanup;
-
-        body = malloc(sizeof(char) * (body_len + 1));
-        if (body == NULL) goto err_cleanup;
-
-        memcpy(body, headers_end + 4, body_len);
-        body[body_len] = '\0';
-
-        req->body_len = body_len;
-        req->body = body;
-    }
-    else if (body_len > 0) {
-        goto err_cleanup;
-    }
-
-    free(buffer);
-    return 1;
-
-err_cleanup:
-    free(buffer);
-    free(headers);
-    free(body);
-    return -1;
-}
-
-void free_req(request_t req) {
-    free(req.headers);
-    free(req.body);
-}
-
-/*
- * write all bytes to socket (handles partial writes)
- */
-int write_all(int fd, const char* buf, int len) {
-    /*
-     * write() may not send all bytes in one call (partial write).
-     * Loop until all bytes are sent.
-     */
-    int total = 0;
-
-    while (total < len) {
-        ssize_t n = write(fd, buf + total, len - total);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) {
-            return -1;
-        }
-        total += n;
-    }
-
+int main(void) {
+    init_server_event_loop();
     return 0;
 }
