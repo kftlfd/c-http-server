@@ -15,6 +15,17 @@
 #define MAX_CLIENTS 10  // Max number of active connections
 #define MAX_REQUEST_SIZE (1024 * 1024) // 1 MB
 
+typedef enum {
+    MODE_ECHO,
+    MODE_FS
+} server_mode_t;
+
+typedef struct {
+    server_mode_t mode;
+    const char* fs_root;   // NULL for echo
+    int keep_alive_timeout_ms;
+} server_config_t;
+
 typedef enum ClientState {
     STATE_READING,
     STATE_WRITING,
@@ -681,7 +692,38 @@ void init_server_event_loop() {
     printf("Server shutdown.\n");
 }
 
-int main(void) {
+// ----------------------------------------------
+// Entrypoint
+// ----------------------------------------------
+
+int main(int argc, char** argv) {
+    server_config_t config = { 0 };
+
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s echo | fs <dir>\n", argv[0]);
+        exit(1);
+    }
+
+    if (strcmp(argv[1], "echo") == 0) {
+        config.mode = MODE_ECHO;
+    }
+    else if (strcmp(argv[1], "fs") == 0) {
+        config.mode = MODE_FS;
+        if (argc < 3) {
+            printf("Usage: %s fs <dir>\n", argv[0]);
+            exit(1);
+        }
+
+        printf("fs mode not implemented\n");
+        exit(0);
+    }
+    else {
+        fprintf(stderr, "Unknown command\n");
+        exit(1);
+    }
+
+    config.keep_alive_timeout_ms = 5000;
+
     init_server_event_loop();
     return 0;
 }
