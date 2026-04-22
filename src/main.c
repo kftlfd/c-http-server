@@ -265,8 +265,9 @@ void handle_request(client_t* client) {
             client->state = STATE_ERROR;
             return;
         }
-        client->response_len = sprintf(
+        client->response_len = snprintf(
             client->response,
+            1024,
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: text/plain\r\n"
             "Content-Length: %d\r\n\r\n",
@@ -304,6 +305,7 @@ void handle_request(client_t* client) {
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/plain\r\n"
         "Content-Length: %d\r\n"
+        "Connection: close\r\n"
         "\r\n"
         "%s",
         body_len,
@@ -329,7 +331,7 @@ void handle_read(client_t* client) {
     while (1) {
         // grow buffer if needed
         if (client->buffer_len + 1 > client->buffer_cap) {
-            if (client->buffer_cap * 2 > MAX_REQUEST_SIZE) {
+            if (client->buffer_cap >= MAX_REQUEST_SIZE / 2) {
                 client->state = STATE_ERROR;
                 return;
             }
@@ -399,8 +401,8 @@ void handle_read(client_t* client) {
                 // Parse Content-Length
                 char* cl = strstr(client->buffer, "Content-Length:");
                 if (cl != NULL) {
-                    sscanf(cl, "Content-Length: %d", &client->content_len);
-                    if (client->content_len < 0 || client->content_len > MAX_REQUEST_SIZE) {
+                    int n = sscanf(cl, "Content-Length: %d", &client->content_len);
+                    if (n != 1 || client->content_len < 0 || client->content_len > MAX_REQUEST_SIZE) {
                         client->state = STATE_ERROR;
                         return;
                     };
@@ -426,8 +428,9 @@ void handle_read(client_t* client) {
 next_step:
     printf(
         "---\n"
-        "%s\n"
+        "%.*s\n"
         "---\n",
+        client->buffer_len,
         client->buffer
     );
 
