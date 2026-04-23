@@ -22,7 +22,7 @@ typedef enum {
 
 typedef struct {
     server_mode_t mode;
-    const char* fs_root;   // NULL for echo
+    char* fs_root;   // NULL for echo
     int keep_alive_timeout_ms;
 } server_config_t;
 
@@ -383,40 +383,38 @@ next_step: {
 // Create response
 // ----------------------------------------------
 
-void handle_request(client_t* client) {
-    /**
-     * Create echo response
-     */
-
+int create_echo_response(client_t* client) {
     if (client->body == NULL) {
         client->response = malloc(1024);
-        if (client->response == NULL) goto err_next;
+        if (client->response == NULL) return 1;
 
         client->response_len = snprintf(
             client->response,
             1024,
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: text/plain\r\n"
-            "Content-Length: %d\r\n\r\n",
+            "Content-Length: %d\r\n"
+            "Connection: close\r\n"
+            "\r\n",
             0
         );
 
         if (client->response_len < 0) {
             fprintf(stderr, "write response: sprintf failed or truncated\n");
-            goto err_next;
+            return 0;
         }
     }
     else {
-        int body_len = (client->buffer + client->buffer_len) - client->body;
+        int body_len = client->content_len;
 
-        if (body_len > INT_MAX - 4096) goto err_next;
+        if (body_len > INT_MAX - 4096) return 0;
 
         int response_cap = 4096 + body_len;
         client->response = malloc(sizeof(char) * response_cap);
 
         if (client->response == NULL) {
             perror("allocate response");
-            goto err_next;
+            return 0;
         }
 
         client->response_len = snprintf(
@@ -434,13 +432,54 @@ void handle_request(client_t* client) {
 
         if (client->response_len < 0 || client->response_len >= response_cap) {
             fprintf(stderr, "write response: sprintf failed or truncated\n");
-            goto err_next;
+            return 0;
         }
     }
-    goto write_next;
+    return 1;
+}
 
-err_next: { client->state = STATE_ERROR; return; }
-write_next: { client->state = STATE_WRITING; return; }
+int create_fs_response(client_t* client, server_config_t* config) {
+    client->response = malloc(1024);
+    if (!client->response) return 0;
+
+    char* response_body = malloc(1024);
+    if (!response_body) return 0;
+
+    int body_len = snprintf(response_body, 1024,
+        "Not implemented\n"
+        "Serving files from %s\n",
+        config->fs_root
+    );
+    if (body_len < 1) { free(response_body); return 0; }
+
+    int n = snprintf(client->response, 1024,
+        "HTTP/1.1 501 Not Implemented\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "%s",
+        body_len,
+        response_body
+    );
+    if (n < 1) { free(response_body); return 0; }
+
+    client->response_len = n;
+    free(response_body);
+    return 1;
+}
+
+void handle_request(client_t* client, server_config_t* config) {
+    int ok = 0;
+    if (config->mode == MODE_ECHO) {
+        ok = create_echo_response(client);
+    }
+    else {
+        ok = create_fs_response(client, config);
+    }
+
+    if (ok) client->state = STATE_WRITING;
+    else client->state = STATE_ERROR;
 }
 
 // ----------------------------------------------
@@ -479,7 +518,7 @@ void handle_write(client_t* client) {
 // Main loop
 // ----------------------------------------------
 
-void init_server_event_loop() {
+void init_server_event_loop(server_config_t* config) {
     setup_signal_handlers();
 
     int server_fd = setup_server();
@@ -653,7 +692,7 @@ void init_server_event_loop() {
 
             if (client->state == STATE_HANDLING) {
                 printf("client handling\n");
-                handle_request(client);
+                handle_request(client, config);
             }
 
             if (client->state == STATE_WRITING && (pfds[i].revents & POLLOUT)) {
@@ -711,9 +750,11 @@ int main(int argc, char** argv) {
             printf("Usage: %s fs <dir>\n", argv[0]);
             exit(1);
         }
-
-        printf("fs mode not implemented\n");
-        exit(0);
+        config.fs_root = strdup(argv[2]);
+        if (!config.fs_root) {
+            perror("fs_root strdup");
+            exit(1);
+        }
     }
     else {
         fprintf(stderr, "Unknown command\n");
@@ -722,6 +763,6 @@ int main(int argc, char** argv) {
 
     config.keep_alive_timeout_ms = 5000;
 
-    init_server_event_loop();
+    init_server_event_loop(&config);
     return 0;
 }
