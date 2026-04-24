@@ -10,6 +10,7 @@
 #include <limits.h>     // INT_MAX
 #include <fcntl.h>      // fcntl(), O_NONBLOCK
 #include <time.h>       // timespec, clock_gettime
+#include <sys/stat.h>  // stat()
 
 #define PORT 8080       // Port the server will listen on
 #define BACKLOG 10      // Max number of pending connections
@@ -18,13 +19,14 @@
 #define MAX_HEADERS_SIZE (16 * 1024) // 16 KB
 #define MAX_HEADERS_COUNT 100
 #define MAX_HEADER_LINE 2048
+#define MAX_FILE_SIZE (4 * 1024 * 1024) // 4 MB
 
-typedef enum {
+typedef enum ServerMode {
     MODE_ECHO,
     MODE_FS
 } server_mode_t;
 
-typedef struct {
+typedef struct ServerConfig {
     server_mode_t mode;
     char* fs_root;   // NULL for echo
     int keep_alive_timeout_ms;
@@ -536,7 +538,7 @@ next_step: {
 }
 
 // ----------------------------------------------
-// Create response
+// Echo response
 // ----------------------------------------------
 
 int create_echo_response(client_t* client) {
@@ -598,7 +600,88 @@ int create_echo_response(client_t* client) {
     return 1;
 }
 
+// ----------------------------------------------
+// FS response
+// ----------------------------------------------
+
+int is_valid_path(const char* path) {
+    // not empty and starts with "/"
+    if (!path || strlen(path) < 1 || path[0] != '/') return 0;
+
+    // allow only safe characters
+    for (const char* p = path; *p; p++) {
+        char c = *p;
+        if (
+            !(c >= 'a' && c <= 'z')
+            && !(c >= 'A' && c <= 'Z')
+            && !(c >= '0' && c <= '9')
+            && c != '/'
+            && c != '.'
+            && c != '-'
+            && c != '_'
+            ) return 0;
+    }
+
+    // reject ".." and double slash
+    if (strstr(path, "..") || strstr(path, "//")) return 0;
+
+    return 1;
+}
+
+int resolve_path(char* out, size_t cap, server_config_t* config, const char* url_path) {
+    return 0;
+}
+
+const char* get_mime_type(const char* path) {
+    // strrchr(path, '.');
+    return "";
+};
+
+int create_400_bad_request_response(client_t* client) {
+    client->response = malloc(512);
+    if (!client->response) return 0;
+
+    char* conn = client->request.connection_close ? "close" : "keep-alive";
+
+    int n = snprintf(client->response, 512,
+        "HTTP/1.1 400 Bad Request\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: %s\r\n"
+        "\r\n",
+        conn
+    );
+    if (n < 1) { return 0; }
+
+    client->response_len = n;
+    return 1;
+}
+
+int create_405_invalid_method_response(client_t* client) {
+    client->response = malloc(512);
+    if (!client->response) return 0;
+
+    char* conn = client->request.connection_close ? "close" : "keep-alive";
+
+    int n = snprintf(client->response, 512,
+        "HTTP/1.1 405 Method Not Allowed\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: %s\r\n"
+        "\r\n",
+        conn
+    );
+    if (n < 1) { return 0; }
+
+    client->response_len = n;
+    return 1;
+}
+
 int create_fs_response(client_t* client, server_config_t* config) {
+    if (strcmp(client->request.method, "GET") != 0) {
+        return create_405_invalid_method_response(client);
+    }
+    if (!is_valid_path(client->request.path)) {
+        return create_400_bad_request_response(client);
+    }
 
     client->response = malloc(1024);
     if (!client->response) return 0;
@@ -632,6 +715,10 @@ int create_fs_response(client_t* client, server_config_t* config) {
     free(response_body);
     return 1;
 }
+
+// ----------------------------------------------
+// Handle request
+// ----------------------------------------------
 
 void handle_request(client_t* client, server_config_t* config) {
     int ok = 0;
@@ -973,6 +1060,11 @@ int main(int argc, char** argv) {
         config.fs_root = strdup(argv[2]);
         if (!config.fs_root) {
             perror("fs_root strdup");
+            exit(1);
+        }
+        struct stat st;
+        if (stat(config.fs_root, &st) < 0 || !S_ISDIR(st.st_mode)) {
+            fprintf(stderr, "Invalid dir: %s\n", config.fs_root);
             exit(1);
         }
     }
