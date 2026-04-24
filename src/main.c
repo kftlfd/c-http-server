@@ -66,8 +66,6 @@ typedef struct Client {
     request_t request;
     int headers_done;
     int headers_len;
-    int has_content_len;
-    int content_len;
 
     char* response;
     int response_len;
@@ -286,7 +284,7 @@ void close_client(pollfd_t* pfds, client_t* clients, int* nfds, int i) {
 /**
  * Parse request line, headers, populate `client->request`
  */
-int parse_request(client_t* client) {
+int parse_request_headers(client_t* client) {
     char* buf = client->buffer;
 
     /**
@@ -340,9 +338,10 @@ int parse_request(client_t* client) {
         if (sscanf(p, "%[^:]: %2047[^\r\n]", key, value) == 2) {
 
             if (strcasecmp(key, "content-length") == 0) {
-                int len = atoi(value);
-                if (len < 0 || len > MAX_REQUEST_SIZE) return 0;
-                client->request.content_len = len;
+                char* end;
+                long len = strtol(value, &end, 10);
+                if (*end != '\0' || len < 0 || len > MAX_REQUEST_SIZE) return 0;
+                client->request.content_len = (int)len;
             }
             else if (strcasecmp(key, "connection") == 0) {
                 if (strcasecmp(value, "keep-alive") == 0) {
@@ -368,6 +367,7 @@ int parse_request(client_t* client) {
 
 void reset_client_for_next_request(client_t* client) {
     int remaining = client->buffer_len - client->request.headers_len - client->request.content_len;
+    if (remaining < 0) remaining = 0;
 
     // Shift buffer
     if (remaining > 0) {
@@ -427,9 +427,9 @@ void handle_read(client_t* client) {
         size_t read_bytes = client->buffer_cap - client->buffer_len - 1; // room left in buffer
 
         // cap read to expected content len
-        if (client->headers_done && client->has_content_len) {
+        if (client->headers_done && client->request.content_len > 0) {
             // end of expected request = body start + declared content length
-            char* want_end = client->request.body + client->content_len;
+            char* want_end = client->request.body + client->request.content_len;
 
             if (want_end > write_pos) {
                 size_t remaining = want_end - write_pos;
@@ -507,14 +507,11 @@ void handle_read(client_t* client) {
                 client->request.headers_len = headers_len;
                 client->request.body = headers_end + 4;
 
-                client->has_content_len = 0;
-                client->content_len = 0;
+                if (!parse_request_headers(client)) goto err_next;
             }
         }
 
         if (client->headers_done) {
-            if (!parse_request(client)) goto err_next;
-
             int body_received = (client->buffer + client->buffer_len) - client->request.body;
 
             if (body_received >= client->request.content_len) goto next_step;
@@ -861,8 +858,6 @@ void init_server_event_loop(server_config_t* config) {
 
                 clients[nfds].headers_done = 0;
                 clients[nfds].headers_len = 0;
-                clients[nfds].has_content_len = 0;
-                clients[nfds].content_len = 0;
                 clients[nfds].response = NULL;
                 clients[nfds].response_len = 0;
                 clients[nfds].response_sent = 0;
@@ -912,7 +907,7 @@ void init_server_event_loop(server_config_t* config) {
                 handle_write(client);
             }
 
-            if (client->state == STATE_READING && client->buffer_len > 0) {
+            if (client->state == STATE_READING && client->buffer_len > 0 && !client->peer_closed) {
                 // try to parse next request immediately (pipeline)
                 handle_read(client);
             }
