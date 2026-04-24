@@ -14,6 +14,8 @@
 #define BACKLOG 10      // Max number of pending connections
 #define MAX_CLIENTS 10  // Max number of active connections
 #define MAX_REQUEST_SIZE (1024 * 1024) // 1 MB
+#define MAX_HEADERS_SIZE (16 * 1024) // 16 KB
+#define MAX_HEADER_LINE 2048
 
 typedef enum {
     MODE_ECHO,
@@ -34,6 +36,20 @@ typedef enum ClientState {
     STATE_ERROR
 } client_state_t;
 
+typedef struct Request {
+    int headers_len;
+    int body_len;
+
+    char method[8];
+    char path[1024];
+    char version[16];
+
+    int content_len;
+    int connection_close; // 1 = close, 0 = keep-alive
+
+    char* body;
+} request_t;
+
 typedef struct Client {
     client_state_t state;
     int fd;
@@ -43,9 +59,9 @@ typedef struct Client {
     int buffer_len;
     int buffer_cap;
 
-    char* body;
-
+    request_t request;
     int headers_done;
+    int headers_len;
     int has_content_len;
     int content_len;
 
@@ -54,14 +70,6 @@ typedef struct Client {
     int response_sent;
 } client_t;
 
-typedef struct Request {
-    int headers_len;
-    int body_len;
-    char method[8];
-    char path[1024];
-    char* headers;
-    char* body;
-} request_t;
 
 typedef struct pollfd pollfd_t;
 
@@ -241,7 +249,7 @@ void free_client(client_t* client) {
     if (client->buffer != NULL) {
         free(client->buffer);
         client->buffer = NULL;
-        client->body = NULL;
+        client->request.body = NULL;
     }
     if (client->response != NULL) {
         free(client->response);
@@ -267,6 +275,76 @@ void close_client(pollfd_t* pfds, client_t* clients, int* nfds, int i) {
 // ----------------------------------------------
 
 /**
+ * Parse request line, headers, populate `client->request`
+ */
+int parse_request(client_t* client) {
+    char* buf = client->buffer;
+
+    /**
+     * Parse request line
+     */
+    char* line_end = strstr(buf, "\r\n");
+    if (!line_end) return 0;
+
+    *line_end = '\0';
+
+    if (sscanf(buf,
+        "%7s %1023s %15s",
+        client->request.method,
+        client->request.path,
+        client->request.version
+    ) != 3) return 0;
+
+    *line_end = '\r';
+
+    /**
+     * Parse headers
+     */
+    char* p = line_end + 2;
+    char* headers_end = client->buffer + client->headers_len;
+
+    client->request.content_len = 0;
+    client->request.connection_close = 1;
+
+    while (p < headers_end - 2) {
+        char* next = strstr(p, "\r\n");
+        if (!next) return 0;
+
+        if (next == p) break; // empty line
+
+        *next = '\0';
+
+        char key[MAX_HEADER_LINE];
+        char value[MAX_HEADER_LINE];
+
+        if (sscanf(p, "%[^:]: %2047[^\r\n]", key, value) == 2) {
+
+            if (strcasecmp(key, "content-length") == 0) {
+                int len = atoi(value);
+                if (len < 0 || len > MAX_REQUEST_SIZE) return 0;
+                client->request.content_len = len;
+            }
+            else if (strcasecmp(key, "connection") == 0) {
+                if (strcasecmp(value, "keep-alive") == 0) {
+                    client->request.connection_close = 0;
+                }
+                else {
+                    client->request.connection_close = 1;
+                }
+            }
+
+        }
+
+        *next = '\r';
+        p = next + 2;
+    }
+
+    client->request.body_len = client->request.content_len;
+
+    return 1;
+}
+
+/**
  * Read request from client socket
  * handles partial reads and interrupts
  */
@@ -279,11 +357,11 @@ void handle_read(client_t* client) {
             if (client->buffer_cap > MAX_REQUEST_SIZE / 2) goto err_next;
             client->buffer_cap *= 2;
             int body_offset = -1;
-            if (client->body != NULL) body_offset = client->body - client->buffer;
+            if (client->request.body != NULL) body_offset = client->request.body - client->buffer;
             char* tmp = realloc(client->buffer, client->buffer_cap);
             if (tmp == NULL) goto err_next;
             client->buffer = tmp;
-            if (body_offset >= 0) client->body = client->buffer + body_offset;
+            if (body_offset >= 0) client->request.body = client->buffer + body_offset;
         }
 
         /**
@@ -295,7 +373,7 @@ void handle_read(client_t* client) {
         // cap read to expected content len
         if (client->headers_done && client->has_content_len) {
             // end of expected request = body start + declared content length
-            char* want_end = client->body + client->content_len;
+            char* want_end = client->request.body + client->content_len;
 
             if (want_end > write_pos) {
                 size_t remaining = want_end - write_pos;
@@ -333,32 +411,34 @@ void handle_read(client_t* client) {
         client->buffer_len += n;
         client->buffer[client->buffer_len] = '\0';
 
+        if (!client->headers_done && client->buffer_len > MAX_HEADERS_SIZE) {
+            fprintf(stderr, "Headers too large\n");
+            goto err_next;
+        }
+
         // check for headers end
         if (!client->headers_done) {
-            char* body = strstr(client->buffer, "\r\n\r\n");
-            if (body != NULL) {
+            char* headers_end = strstr(client->buffer, "\r\n\r\n");
+            if (headers_end != NULL) {
                 client->headers_done = 1;
-                client->body = body + 4;
+
+                int headers_len = headers_end - client->buffer + 4;
+                client->headers_len = headers_len;
+
+                client->request.headers_len = headers_len;
+                client->request.body = headers_end + 4;
+
                 client->has_content_len = 0;
                 client->content_len = 0;
-
-                // Parse Content-Length
-                char* cl = strstr(client->buffer, "Content-Length:");
-                if (cl != NULL) {
-                    int n = sscanf(cl, "Content-Length: %d", &client->content_len);
-                    if (n != 1 || client->content_len < 0 || client->content_len > MAX_REQUEST_SIZE) goto err_next;
-                    client->has_content_len = 1;
-                }
             }
         }
 
-        // check if full body is already read
         if (client->headers_done) {
-            if (!client->has_content_len) goto next_step;
+            if (!parse_request(client)) goto err_next;
 
-            int body_received = (client->buffer + client->buffer_len) - client->body;
+            int body_received = (client->buffer + client->buffer_len) - client->request.body;
 
-            if (body_received >= client->content_len) goto next_step;
+            if (body_received >= client->request.content_len) goto next_step;
         }
     }
     return;
@@ -384,7 +464,7 @@ next_step: {
 // ----------------------------------------------
 
 int create_echo_response(client_t* client) {
-    if (client->body == NULL) {
+    if (client->request.content_len == 0 || client->request.body == NULL) {
         client->response = malloc(1024);
         if (client->response == NULL) return 1;
 
@@ -405,7 +485,7 @@ int create_echo_response(client_t* client) {
         }
     }
     else {
-        int body_len = client->content_len;
+        int body_len = client->request.content_len;
 
         if (body_len > INT_MAX - 4096) return 0;
 
@@ -427,7 +507,7 @@ int create_echo_response(client_t* client) {
             "\r\n"
             "%s",
             body_len,
-            client->body
+            client->request.body
         );
 
         if (client->response_len < 0 || client->response_len >= response_cap) {
@@ -649,8 +729,12 @@ void init_server_event_loop(server_config_t* config) {
                 clients[nfds].buffer = buffer;
                 clients[nfds].buffer_len = 0;
                 clients[nfds].buffer_cap = buffer_cap;
-                clients[nfds].body = NULL;
+
+                memset(&clients[nfds].request, 0, sizeof(request_t));
+                clients[nfds].request.connection_close = 0; // default HTTP/1.1 behavior
+
                 clients[nfds].headers_done = 0;
+                clients[nfds].headers_len = 0;
                 clients[nfds].has_content_len = 0;
                 clients[nfds].content_len = 0;
                 clients[nfds].response = NULL;
