@@ -9,12 +9,14 @@
 #include <poll.h>       // poll()
 #include <limits.h>     // INT_MAX
 #include <fcntl.h>      // fcntl(), O_NONBLOCK
+#include <time.h>       // timespec, clock_gettime
 
 #define PORT 8080       // Port the server will listen on
 #define BACKLOG 10      // Max number of pending connections
 #define MAX_CLIENTS 10  // Max number of active connections
 #define MAX_REQUEST_SIZE (1024 * 1024) // 1 MB
 #define MAX_HEADERS_SIZE (16 * 1024) // 16 KB
+#define MAX_HEADERS_COUNT 100
 #define MAX_HEADER_LINE 2048
 
 typedef enum {
@@ -54,6 +56,8 @@ typedef struct Client {
     client_state_t state;
     int fd;
     struct sockaddr_in addr;
+    long last_activity_ms;
+    int peer_closed;
 
     char* buffer;
     int buffer_len;
@@ -70,8 +74,13 @@ typedef struct Client {
     int response_sent;
 } client_t;
 
-
 typedef struct pollfd pollfd_t;
+
+long now_ms() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (ts.tv_sec * 1000L) + (ts.tv_nsec / 1000000L);
+}
 
 // ----------------------------------------------
 // Signal handlers
@@ -312,11 +321,16 @@ int parse_request(client_t* client) {
 
     client->request.content_len = 0;
 
+    int headers_count = 0;
+
     while (p < headers_end - 2) {
         char* next = strstr(p, "\r\n");
         if (!next) return 0;
 
         if (next == p) break; // empty line
+
+        headers_count++;
+        if (headers_count > MAX_HEADERS_COUNT) return 0;
 
         *next = '\0';
 
@@ -338,7 +352,9 @@ int parse_request(client_t* client) {
                     client->request.connection_close = 1;
                 }
             }
-
+            else if (strcasecmp(key, "transfer-encoding") == 0) {
+                return 0; // not supported
+            }
         }
 
         *next = '\r';
@@ -380,6 +396,7 @@ void reset_client_for_next_request(client_t* client) {
     client->response_len = 0;
     client->response_sent = 0;
 
+    client->last_activity_ms = now_ms();
     client->state = STATE_READING;
 }
 
@@ -435,20 +452,43 @@ void handle_read(client_t* client) {
 
         if (n < 0) {
             if (errno == EINTR) continue;
-            else if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // If peer already closed, no more data will come
+                if (client->peer_closed) goto err_next;
+                break;
+            }
             else goto err_next;
         }
 
         /**
-         * finished reading
+         * EOF
          */
         if (n == 0) {
-            if (client->headers_done) goto next_step;
-            else goto err_next;
+            client->peer_closed = 1;
+
+            // Case 1: no new request started -> clean close
+            if (!client->headers_done && client->buffer_len == 0) {
+                client->state = STATE_DONE;
+                return;
+            }
+
+            // Case 2: partial request -> error
+            if (!client->headers_done) goto err_next;
+
+            // Case 3: headers done, check body
+            // If no body expected OR already fully read -> OK
+            int body_received = 0;
+            if (client->request.body) {
+                body_received = (client->buffer + client->buffer_len) - client->request.body;
+            }
+            if (body_received >= client->request.content_len) goto next_step;
+
+            goto err_next;
         };
 
         client->buffer_len += n;
         client->buffer[client->buffer_len] = '\0';
+        client->last_activity_ms = now_ms();
 
         if (!client->headers_done && client->buffer_len > MAX_HEADERS_SIZE) {
             fprintf(stderr, "Headers too large\n");
@@ -636,9 +676,10 @@ void handle_write(client_t* client) {
         }
 
         client->response_sent += n;
+        client->last_activity_ms = now_ms();
     }
 
-    if (client->request.connection_close) {
+    if (client->request.connection_close || client->peer_closed) {
         client->state = STATE_DONE;
     }
     else {
@@ -695,7 +736,23 @@ void init_server_event_loop(server_config_t* config) {
             else pfds[i].events = 0;
         }
 
-        /*
+        /**
+         * get min_timeout for poll
+         */
+        long now = now_ms();
+        long min_timeout = config->keep_alive_timeout_ms;
+
+        for (int i = 1; i < nfds; i++) {
+            long idle = now - clients[i].last_activity_ms;
+            long remaining = config->keep_alive_timeout_ms - idle;
+            if (remaining < min_timeout) {
+                min_timeout = remaining;
+            }
+        }
+
+        if (min_timeout < 0) min_timeout = 0;
+
+        /**
          * Use poll() before accept() to allow signal interruption.
          * - waits until one of the fds is ready
          * - or interrupted by signal (EINTR)
@@ -712,7 +769,7 @@ void init_server_event_loop(server_config_t* config) {
          *   not return until a connection arrives. Using poll() first
          *   ensures we check the keep_running flag when the signal arrives.
          */
-        if (poll(pfds, nfds, -1) < 0) { // -1 = infinite timeout
+        if (poll(pfds, nfds, min_timeout) < 0) {
             /*
              * EINTR: A signal interrupted the poll() call.
              * This happens when SIGINT/SIGTERM is received.
@@ -720,6 +777,20 @@ void init_server_event_loop(server_config_t* config) {
              */
             if (errno != EINTR) perror("poll");
             break;
+        }
+
+        /**
+         * close timed-out connections
+         */
+        long now2 = now_ms();
+
+        for (int i = 1; i < nfds; i++) {
+            long idle = now2 - clients[i].last_activity_ms;
+            if (idle >= config->keep_alive_timeout_ms) {
+                printf("client timeout\n");
+                close_client(pfds, clients, &nfds, i);
+                i--;
+            }
         }
 
         // Check all file descriptors
@@ -778,6 +849,9 @@ void init_server_event_loop(server_config_t* config) {
                 clients[nfds].state = STATE_READING;
                 clients[nfds].fd = client_fd;
                 clients[nfds].addr = client_addr;
+                clients[nfds].last_activity_ms = now_ms();
+                clients[nfds].peer_closed = 0;
+
                 clients[nfds].buffer = buffer;
                 clients[nfds].buffer_len = 0;
                 clients[nfds].buffer_cap = buffer_cap;
@@ -801,8 +875,10 @@ void init_server_event_loop(server_config_t* config) {
             /**
              * Socket error
              */
-            if (pfds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-                fprintf(stderr, "socket error\n");
+            if (pfds[i].revents & (POLLERR | POLLNVAL)) {
+                fprintf(stderr, "socket error: ");
+                if (pfds[i].revents & POLLERR) fprintf(stderr, "POLLERR\n");
+                else  fprintf(stderr, "POLLNVAL\n");
                 close_client(pfds, clients, &nfds, i);
                 i--;
                 continue;
@@ -839,6 +915,14 @@ void init_server_event_loop(server_config_t* config) {
             if (client->state == STATE_READING && client->buffer_len > 0) {
                 // try to parse next request immediately (pipeline)
                 handle_read(client);
+            }
+
+            if (client->state == STATE_READING && client->peer_closed && !(pfds[i].revents & POLLIN)) {
+                // no more data will come
+                printf("peer closed without full request\n");
+                close_client(pfds, clients, &nfds, i);
+                i--;
+                continue;
             }
 
             if (client->state == STATE_DONE || client->state == STATE_ERROR) {
