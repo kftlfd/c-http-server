@@ -297,6 +297,13 @@ int parse_request(client_t* client) {
 
     *line_end = '\r';
 
+    if (strcmp(client->request.version, "HTTP/1.1") == 0) {
+        client->request.connection_close = 0;
+    }
+    else {
+        client->request.connection_close = 1;
+    }
+
     /**
      * Parse headers
      */
@@ -304,7 +311,6 @@ int parse_request(client_t* client) {
     char* headers_end = client->buffer + client->headers_len;
 
     client->request.content_len = 0;
-    client->request.connection_close = 1;
 
     while (p < headers_end - 2) {
         char* next = strstr(p, "\r\n");
@@ -328,7 +334,7 @@ int parse_request(client_t* client) {
                 if (strcasecmp(value, "keep-alive") == 0) {
                     client->request.connection_close = 0;
                 }
-                else {
+                else if (strcasecmp(value, "close") == 0) {
                     client->request.connection_close = 1;
                 }
             }
@@ -342,6 +348,39 @@ int parse_request(client_t* client) {
     client->request.body_len = client->request.content_len;
 
     return 1;
+}
+
+void reset_client_for_next_request(client_t* client) {
+    int remaining = client->buffer_len - client->request.headers_len - client->request.content_len;
+
+    // Shift buffer
+    if (remaining > 0) {
+        memmove(
+            client->buffer,
+            client->request.body + client->request.content_len,
+            remaining
+        );
+    }
+    client->buffer_len = remaining;
+    client->buffer[client->buffer_len] = '\0';
+
+    // Reset parsing state
+    client->headers_done = 0;
+    client->headers_len = 0;
+
+    memset(&client->request, 0, sizeof(request_t));
+    client->request.connection_close = 1;
+
+    // Reset response
+    if (client->response) {
+        free(client->response);
+        client->response = NULL;
+    }
+
+    client->response_len = 0;
+    client->response_sent = 0;
+
+    client->state = STATE_READING;
 }
 
 /**
@@ -464,6 +503,8 @@ next_step: {
 // ----------------------------------------------
 
 int create_echo_response(client_t* client) {
+    char* conn = client->request.connection_close ? "close" : "keep-alive";
+
     if (client->request.content_len == 0 || client->request.body == NULL) {
         client->response = malloc(1024);
         if (client->response == NULL) return 1;
@@ -474,9 +515,10 @@ int create_echo_response(client_t* client) {
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: text/plain\r\n"
             "Content-Length: %d\r\n"
-            "Connection: close\r\n"
+            "Connection: %s\r\n"
             "\r\n",
-            0
+            0,
+            conn
         );
 
         if (client->response_len < 0) {
@@ -503,10 +545,11 @@ int create_echo_response(client_t* client) {
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: text/plain\r\n"
             "Content-Length: %d\r\n"
-            "Connection: close\r\n"
+            "Connection: %s\r\n"
             "\r\n"
             "%s",
             body_len,
+            conn,
             client->request.body
         );
 
@@ -519,6 +562,7 @@ int create_echo_response(client_t* client) {
 }
 
 int create_fs_response(client_t* client, server_config_t* config) {
+
     client->response = malloc(1024);
     if (!client->response) return 0;
 
@@ -532,14 +576,17 @@ int create_fs_response(client_t* client, server_config_t* config) {
     );
     if (body_len < 1) { free(response_body); return 0; }
 
+    char* conn = client->request.connection_close ? "close" : "keep-alive";
+
     int n = snprintf(client->response, 1024,
         "HTTP/1.1 501 Not Implemented\r\n"
         "Content-Type: text/plain\r\n"
         "Content-Length: %d\r\n"
-        "Connection: close\r\n"
+        "Connection: %s\r\n"
         "\r\n"
         "%s",
         body_len,
+        conn,
         response_body
     );
     if (n < 1) { free(response_body); return 0; }
@@ -591,7 +638,12 @@ void handle_write(client_t* client) {
         client->response_sent += n;
     }
 
-    client->state = STATE_DONE;
+    if (client->request.connection_close) {
+        client->state = STATE_DONE;
+    }
+    else {
+        reset_client_for_next_request(client);
+    }
 }
 
 // ----------------------------------------------
@@ -784,12 +836,17 @@ void init_server_event_loop(server_config_t* config) {
                 handle_write(client);
             }
 
+            if (client->state == STATE_READING && client->buffer_len > 0) {
+                // try to parse next request immediately (pipeline)
+                handle_read(client);
+            }
+
             if (client->state == STATE_DONE || client->state == STATE_ERROR) {
                 if (client->state == STATE_DONE) {
                     printf("request done\n");
                 }
                 else {
-                    printf("request error\n");
+                    fprintf(stderr, "request error\n");
                 }
                 close_client(pfds, clients, &nfds, i);
                 i--;
