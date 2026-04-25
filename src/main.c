@@ -826,7 +826,10 @@ int create_501_not_implemented_response(client_t* client) {
 }
 
 int create_fs_response(client_t* client, server_config_t* config) {
-    if (strcmp(client->request.method, "GET") != 0) {
+    if (
+        strcmp(client->request.method, "GET") != 0
+        && strcmp(client->request.method, "HEAD") != 0
+        ) {
         return create_405_invalid_method_response(client);
     }
     if (!is_valid_path(client->request.path)) {
@@ -848,6 +851,32 @@ int create_fs_response(client_t* client, server_config_t* config) {
 
     const char* mime = get_mime_type(resolved);
     const char* conn = client->request.connection_close ? "close" : "keep-alive";
+
+    if (strcmp(client->request.method, "HEAD") != 0) {
+        int header_cap = 512;
+        client->response = malloc(header_cap);
+        if (!client->response) {
+            free(file_data);
+            return 0;
+        }
+        int header_len = snprintf(client->response, header_cap,
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: %s\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: %s\r\n"
+            "\r\n",
+            mime,
+            file_len,
+            conn
+        );
+        if (header_len <= 0 || header_len >= header_cap) {
+            free(file_data);
+            return 0;
+        }
+        client->response_len = header_len;
+        free(file_data);
+        return 1;
+    }
 
     // allocate header + file
     int header_cap = 1024;
