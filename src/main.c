@@ -162,13 +162,24 @@ long now_ms() {
 
 static log_level_t LOG_LEVEL = LOG_L_INFO;
 
-int parse_log_level(const char* s) {
-    if (strcmp(s, "dump") == 0) { LOG_LEVEL = LOG_L_DUMP; return 1; }
-    if (strcmp(s, "debug") == 0) { LOG_LEVEL = LOG_L_DEBUG; return 1; }
-    if (strcmp(s, "info") == 0) { LOG_LEVEL = LOG_L_INFO; return 1; }
-    if (strcmp(s, "warn") == 0) { LOG_LEVEL = LOG_L_WARN; return 1; }
-    if (strcmp(s, "error") == 0) { LOG_LEVEL = LOG_L_ERROR; return 1; }
+int parse_log_level(const char* s, log_level_t* out) {
+    if (strcmp(s, "dump") == 0) { *out = LOG_L_DUMP; return 1; }
+    if (strcmp(s, "debug") == 0) { *out = LOG_L_DEBUG; return 1; }
+    if (strcmp(s, "info") == 0) { *out = LOG_L_INFO; return 1; }
+    if (strcmp(s, "warn") == 0) { *out = LOG_L_WARN; return 1; }
+    if (strcmp(s, "error") == 0) { *out = LOG_L_ERROR; return 1; }
     return 0;
+}
+
+const char* state_str(client_state_t s) {
+    switch (s) {
+    case STATE_READING: return "READ";
+    case STATE_HANDLING: return "HANDL";
+    case STATE_WRITING: return "WRITE";
+    case STATE_DONE: return "DONE";
+    case STATE_ERROR: return "ERROR";
+    default: return "?";
+    }
 }
 
 void log_msg(log_level_t level, const char* fmt, ...) {
@@ -181,9 +192,16 @@ void log_msg(log_level_t level, const char* fmt, ...) {
         (level == LOG_L_WARN) ? "WARN" :
         "ERROR";
 
-    long ts = now_ms();
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
 
-    fprintf(stderr, "[%ld] [%s]\t", ts, level_str);
+    struct tm tm;
+    localtime_r(&ts.tv_sec, &tm); // gmtime_r or localtime_r
+
+    char buf[32];
+    strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm);
+
+    fprintf(stderr, "[%s.%03ldZ] [%s]\t", buf, ts.tv_nsec / 1000000, level_str);
 
     va_list args;
     va_start(args, fmt);
@@ -202,10 +220,16 @@ void log_msg(log_level_t level, const char* fmt, ...) {
 #define LOG_WARN(fmt, ...) log_msg(LOG_L_WARN, fmt, ##__VA_ARGS__)
 #define LOG_ERROR(fmt, ...) log_msg(LOG_L_ERROR, fmt, ##__VA_ARGS__)
 
+#define LOG_PERROR(fmt, ...) \
+    do { \
+        int err = errno; \
+        log_msg(LOG_L_ERROR, fmt ": %s", ##__VA_ARGS__, strerror(err)); \
+    } while (0)
+
 #define LOG_CLIENT(level, client, fmt, ...) \
-    log_msg(level, "[c=%d fd=%d req=%d state=%d]\t" fmt, \
+    log_msg(level, "[c=%d fd=%d req=%d state=%s]\t" fmt, \
         (client)->id, (client)->fd, (client)->request_id, \
-        (client)->state, ##__VA_ARGS__)
+        state_str((client)->state), ##__VA_ARGS__)
 
 #define LOG_CLIENT_DUMP(client, fmt, ...) LOG_CLIENT(LOG_L_DUMP, client, fmt, ##__VA_ARGS__)
 #define LOG_CLIENT_DEBUG(client, fmt, ...) LOG_CLIENT(LOG_L_DEBUG, client, fmt, ##__VA_ARGS__)
@@ -213,11 +237,10 @@ void log_msg(log_level_t level, const char* fmt, ...) {
 #define LOG_CLIENT_WARN(client, fmt, ...) LOG_CLIENT(LOG_L_WARN, client, fmt, ##__VA_ARGS__)
 #define LOG_CLIENT_ERROR(client, fmt, ...) LOG_CLIENT(LOG_L_ERROR, client, fmt, ##__VA_ARGS__)
 
-#define LOG_PERROR(fmt, ...) \
-    do { \
-        int err = errno; \
-        log_msg(LOG_L_ERROR, fmt ": %s", ##__VA_ARGS__, strerror(err)); \
-    } while (0)
+#define LOG_CLIENT_PERROR(client, fmt, ...) \
+    LOG_PERROR("[c=%d fd=%d req=%d state=%d]\t" fmt, \
+        (client)->id, (client)->fd, (client)->request_id, \
+        state_str((client)->state), ##__VA_ARGS__)
 
 // ----------------------------------------------
 // Signal handlers
@@ -270,7 +293,7 @@ void setup_signal_handlers() {
     sigemptyset(&sa.sa_mask);  // no additional signals blocked
     sa.sa_flags = 0;           // DO NOT use SA_RESTART
     if (sigaction(SIGINT, &sa, NULL) < 0 || sigaction(SIGTERM, &sa, NULL) < 0) {
-        perror("sigaction failed: SIGINT | SIGTERM");
+        LOG_PERROR("sigaction failed: SIGINT | SIGTERM");
         exit(EXIT_FAILURE);
     }
 
@@ -285,7 +308,7 @@ void setup_signal_handlers() {
     sigemptyset(&sa_pipe.sa_mask);
     sa_pipe.sa_flags = 0;
     if (sigaction(SIGPIPE, &sa_pipe, NULL) < 0) {
-        perror("sigaction failed: SIGPIPE");
+        LOG_PERROR("sigaction failed: SIGPIPE");
         exit(EXIT_FAILURE);
     }
 }
@@ -306,7 +329,7 @@ int setup_server() {
      */
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
-        perror("socket failed");
+        LOG_PERROR("socket failed");
         exit(EXIT_FAILURE);
     }
 
@@ -321,7 +344,7 @@ int setup_server() {
      */
     int opt = 1;
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        perror("setsockopt failed");
+        LOG_PERROR("setsockopt failed");
         close(server_fd);
         exit(EXIT_FAILURE);
     }
@@ -344,7 +367,7 @@ int setup_server() {
      * We cast sockaddr_in* to sockaddr* because the API is generic.
      */
     if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
-        perror("bind failed");
+        LOG_PERROR("bind failed");
         close(server_fd);
         exit(EXIT_FAILURE);
     }
@@ -358,7 +381,7 @@ int setup_server() {
      *   Maximum number of pending connections in the queue
      */
     if (listen(server_fd, BACKLOG) < 0) {
-        perror("listen failed");
+        LOG_PERROR("listen failed");
         close(server_fd);
         exit(EXIT_FAILURE);
     }
@@ -603,7 +626,7 @@ void handle_read(client_t* client) {
         }
 
         ssize_t n = read(client->fd, write_pos, read_bytes);
-        LOG_CLIENT_DEBUG(client, "read %zd bytes", n);
+        LOG_CLIENT_DUMP(client, "read %zd bytes", n);
 
         if (n < 0) {
             if (errno == EINTR) continue;
@@ -612,7 +635,10 @@ void handle_read(client_t* client) {
                 if (client->peer_closed) return set_client_error(client, HTTP_400_BAD_REQUEST);
                 break;
             }
-            else set_client_error(client, HTTP_400_BAD_REQUEST);
+            else {
+                LOG_CLIENT_PERROR(client, "read");
+                set_client_error(client, HTTP_400_BAD_REQUEST);
+            }
         }
 
         /**
@@ -687,7 +713,7 @@ next_step: {
         "request:\n---\n"
         "%.*s"
         "\n---",
-        client->request.body + client->request.body_len - client->buffer, client->buffer
+        client->request.headers_len + client->request.body_len, client->buffer
     );
 
     client->state = STATE_HANDLING;
@@ -1032,7 +1058,7 @@ void handle_write(client_t* client) {
     response_t* res = &client->response;
 
     while (res->sent < res->len) {
-        LOG_CLIENT_DEBUG(client, "write progress: %d/%d bytes", res->sent, res->len);
+        LOG_CLIENT_DUMP(client, "write progress: %d/%d bytes", res->sent, res->len);
 
         // write next bytes
         ssize_t n = write(
@@ -1041,12 +1067,13 @@ void handle_write(client_t* client) {
             res->len - res->sent
         );
 
-        LOG_CLIENT_DEBUG(client, "wrote %zd bytes", n);
+        LOG_CLIENT_DUMP(client, "wrote %zd bytes", n);
 
         if (n <= 0) {
             if (errno == EINTR) continue;
             else if (errno == EAGAIN || errno == EWOULDBLOCK) return;
             else {
+                LOG_CLIENT_PERROR(client, "write");
                 client->state = STATE_ERROR;
                 LOG_CLIENT_DEBUG(client, "state -> ERROR");
                 return;
@@ -1075,6 +1102,8 @@ void init_server_event_loop(server_config_t* config) {
 
     int server_fd = setup_server();
 
+    LOG_INFO("mode=%s, log-level=%d, timeout=%dms",
+        config->mode == MODE_ECHO ? "echo" : "fs", LOG_LEVEL, config->keep_alive_timeout_ms);
     LOG_INFO("Server is listening on port %d...", PORT);
 
     /**
@@ -1202,18 +1231,18 @@ void init_server_event_loop(server_config_t* config) {
                     &client_addr_len
                 );
                 if (client_fd < 0) {
-                    if (errno != EINTR) LOG_PERROR("accept");
+                    if (errno != EINTR) LOG_PERROR("[c=%d] accept", next_client_id);
                     continue; // don't kill server, go to next connection
                 }
 
                 if (set_nonblocking(client_fd) < 0) {
-                    LOG_PERROR("fcnt failed");
+                    LOG_PERROR("[c=%d] fcntl failed", next_client_id);
                     close(client_fd);
                     continue;
                 }
 
                 if (nfds >= MAX_CLIENTS + 1) {
-                    LOG_WARN("too many clients, dropping connection");
+                    LOG_WARN("[c=%d] too many clients, dropping connection", next_client_id);
                     close(client_fd);
                     continue;
                 }
@@ -1221,7 +1250,7 @@ void init_server_event_loop(server_config_t* config) {
                 int buffer_cap = 4096;
                 char* buffer = malloc(sizeof(char) * buffer_cap);
                 if (buffer == NULL) {
-                    LOG_ERROR("failed to allocate request buffer");
+                    LOG_ERROR("[c=%d] failed to allocate request buffer", next_client_id);
                     close(client_fd);
                     continue;
                 }
@@ -1257,12 +1286,14 @@ void init_server_event_loop(server_config_t* config) {
                 continue;
             }
 
+            client_t* client = &clients[i];
+
             /**
              * Socket error
              */
             if (pfds[i].revents & (POLLERR | POLLNVAL)) {
-                if (pfds[i].revents & POLLERR) LOG_ERROR("socket error: POLLERR");
-                else LOG_ERROR("socket error: POLLNVAL");
+                if (pfds[i].revents & POLLERR) LOG_CLIENT_ERROR(client, "socket error: POLLERR");
+                else LOG_CLIENT_ERROR(client, "socket error: POLLNVAL");
                 close_client(pfds, clients, &nfds, i);
                 i--;
                 continue;
@@ -1277,7 +1308,6 @@ void init_server_event_loop(server_config_t* config) {
              *  - close client_fd when done
              */
 
-            client_t* client = &clients[i];
             LOG_CLIENT_DEBUG(client, "client ready");
 
             if (client->state == STATE_READING && (pfds[i].revents & POLLIN)) {
@@ -1377,7 +1407,7 @@ int main(int argc, char** argv) {
 
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--log=", 6) == 0) {
-            if (!parse_log_level(argv[i] + 6)) {
+            if (!parse_log_level(argv[i] + 6, &LOG_LEVEL)) {
                 fprintf(stderr, "Invalid log level\n");
                 exit(1);
             }
