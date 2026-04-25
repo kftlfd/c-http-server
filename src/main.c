@@ -52,7 +52,8 @@
 #include <limits.h>     // INT_MAX
 #include <fcntl.h>      // fcntl(), O_NONBLOCK
 #include <time.h>       // timespec, clock_gettime
-#include <sys/stat.h>  // stat()
+#include <sys/stat.h>   // stat()
+#include <stdarg.h>     // va_list, va_start, va_end
 
 #define PORT 8080       // Port the server will listen on
 #define BACKLOG 10      // Max number of pending connections
@@ -62,6 +63,13 @@
 #define MAX_HEADERS_COUNT 100
 #define MAX_HEADER_LINE 2048
 #define MAX_FILE_SIZE (4 * 1024 * 1024) // 4 MB
+
+typedef enum LogLevel {
+    LOG_DEBUG = 0,
+    LOG_INFO,
+    LOG_WARN,
+    LOG_ERROR
+} log_level_t;
 
 typedef enum ServerMode {
     MODE_ECHO,
@@ -116,6 +124,7 @@ typedef struct Response {
 } response_t;
 
 typedef struct Client {
+    int id;
     client_state_t state;
     int fd;
     struct sockaddr_in addr;
@@ -127,6 +136,7 @@ typedef struct Client {
     int buffer_len;
     int buffer_cap;
 
+    int request_id;
     request_t request;
     int headers_done;
     int headers_len;
@@ -136,11 +146,59 @@ typedef struct Client {
 
 typedef struct pollfd pollfd_t;
 
+static int next_client_id = 1;
+static int next_request_id = 1;
+
 long now_ms() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (ts.tv_sec * 1000L) + (ts.tv_nsec / 1000000L);
 }
+
+// ----------------------------------------------
+// Logs
+// ----------------------------------------------
+
+#ifndef LOG_LEVEL_DEFAULT
+#define LOG_LEVEL_DEFAULT LOG_DEBUG
+#endif
+
+static log_level_t LOG_LEVEL = LOG_LEVEL_DEFAULT;
+
+void log_msg(log_level_t level, const char* fmt, ...) {
+    if (level < LOG_LEVEL) return;
+
+    const char* level_str =
+        (level == LOG_DEBUG) ? "DEBUG" :
+        (level == LOG_INFO) ? "INFO" :
+        (level == LOG_WARN) ? "WARN" :
+        "ERROR";
+
+    long ts = now_ms();
+
+    fprintf(stderr, "[%ld] [%s]\t", ts, level_str);
+
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+
+    fprintf(stderr, "\n");
+}
+
+#define LOG(level, fmt, ...) \
+    log_msg(level, fmt, ##__VA_ARGS__)
+
+#define LOG_CLIENT(level, client, fmt, ...) \
+    log_msg(level, "[c=%d fd=%d req=%d state=%d]\t" fmt, \
+        (client)->id, (client)->fd, (client)->request_id, \
+        (client)->state, ##__VA_ARGS__)
+
+#define LOG_PERROR(fmt, ...) \
+    do { \
+        int err = errno; \
+        log_msg(LOG_ERROR, fmt ": %s", ##__VA_ARGS__, strerror(err)); \
+    } while (0)
 
 // ----------------------------------------------
 // Signal handlers
@@ -249,8 +307,6 @@ int setup_server() {
         exit(EXIT_FAILURE);
     }
 
-    printf("Socket created: %d\n", server_fd);
-
     struct sockaddr_in address;
     memset(&address, 0, sizeof(address));
 
@@ -287,8 +343,6 @@ int setup_server() {
         close(server_fd);
         exit(EXIT_FAILURE);
     }
-
-    printf("Server is listening on port %d...\n", PORT);
 
     return server_fd;
 }
@@ -330,6 +384,8 @@ void free_client(client_t* client) {
  * Close client helper: close client socket, update sockets and clients arrays
  */
 void close_client(pollfd_t* pfds, client_t* clients, int* nfds, int i) {
+    LOG_CLIENT(LOG_INFO, &clients[i], "closing connection");
+
     close(pfds[i].fd);
     free_client(clients + i);
 
@@ -340,8 +396,18 @@ void close_client(pollfd_t* pfds, client_t* clients, int* nfds, int i) {
 }
 
 void set_client_error(client_t* client, http_status_t status_code) {
+    if (status_code < 100 || status_code > 599) {
+        LOG_CLIENT(LOG_ERROR, client,
+            "invalid status code %d -> forcing 500",
+            status_code);
+        status_code = HTTP_500_INTERNAL_ERROR;
+    }
+
     client->error_code = status_code;
+    LOG_CLIENT(LOG_ERROR, client, "set error: %d", status_code);
+
     client->state = STATE_HANDLING;
+    LOG_CLIENT(LOG_DEBUG, client, "state -> HANDLING");
 }
 
 // ----------------------------------------------
@@ -464,6 +530,7 @@ void reset_client_for_next_request(client_t* client) {
 
     client->last_activity_ms = now_ms();
     client->state = STATE_READING;
+    LOG_CLIENT(LOG_DEBUG, client, "state -> READING");
     client->error_code = 0;
 }
 
@@ -517,6 +584,7 @@ void handle_read(client_t* client) {
         }
 
         ssize_t n = read(client->fd, write_pos, read_bytes);
+        LOG_CLIENT(LOG_DEBUG, client, "read %zd bytes", n);
 
         if (n < 0) {
             if (errno == EINTR) continue;
@@ -533,10 +601,12 @@ void handle_read(client_t* client) {
          */
         if (n == 0) {
             client->peer_closed = 1;
+            LOG_CLIENT(LOG_INFO, client, "peer closed connection");
 
             // Case 1: no new request started -> clean close
             if (!client->headers_done && client->buffer_len == 0) {
                 client->state = STATE_DONE;
+                LOG_CLIENT(LOG_DEBUG, client, "state -> DONE");
                 return;
             }
 
@@ -559,7 +629,7 @@ void handle_read(client_t* client) {
         client->last_activity_ms = now_ms();
 
         if (!client->headers_done && client->buffer_len > MAX_HEADERS_SIZE) {
-            fprintf(stderr, "Headers too large\n");
+            LOG_CLIENT(LOG_ERROR, client, "headers too large");
             return set_client_error(client, HTTP_400_BAD_REQUEST);
         }
 
@@ -568,6 +638,7 @@ void handle_read(client_t* client) {
             char* headers_end = strstr(client->buffer, "\r\n\r\n");
             if (headers_end != NULL) {
                 client->headers_done = 1;
+                client->request_id = next_request_id++;
 
                 int headers_len = headers_end - client->buffer + 4;
                 client->headers_len = headers_len;
@@ -590,15 +661,12 @@ void handle_read(client_t* client) {
     return;
 
 next_step: {
-    printf(
-        "---\n"
-        "%.*s\n"
-        "---\n",
-        client->buffer_len,
-        client->buffer
-    );
+    LOG_CLIENT(LOG_DEBUG, client,
+        "request: %s %s (body=%d)",
+        client->request.method, client->request.path, client->request.content_len);
 
     client->state = STATE_HANDLING;
+    LOG_CLIENT(LOG_DEBUG, client, "state -> HANDLING");
     return;
     }
 }
@@ -616,16 +684,12 @@ int response_build(
     int body_len,
     int connection_close
 ) {
-    printf("> build: status=%d, body_len=%d\n", status_code, body_len);
-
     int header_cap = 1024;
 
     int total_cap = header_cap + body_len;
 
     res->data = malloc(total_cap);
     if (!res->data) return 0;
-
-    printf("> build: data allocated");
 
     const char* conn = connection_close ? "close" : "keep-alive";
 
@@ -644,8 +708,6 @@ int response_build(
         conn
     );
 
-    printf("> build: header_len=%d\n", header_len);
-
     if (header_len < 0 || header_len >= header_cap) {
         free(res->data);
         return 0;
@@ -657,6 +719,7 @@ int response_build(
 
     res->len = header_len + body_len;
     res->sent = 0;
+    res->status_code = status_code;
     res->connection_close = connection_close;
 
     return 1;
@@ -803,7 +866,6 @@ int resolve_path(char* out, size_t cap, server_config_t* config, const char* url
     char with_index[PATH_MAX];
     n = snprintf(with_index, sizeof(with_index), "%s/index.html", path);
     if (n < 0 || (size_t)n >= sizeof(with_index)) return 0;
-    printf("%s\n", with_index);
     if (file_exists(with_index, &is_dir) && !is_dir) {
         n = snprintf(out, cap, "%s", with_index);
         if (n < 0 || (size_t)n >= cap) return 0;
@@ -911,21 +973,20 @@ void handle_request(client_t* client, server_config_t* config) {
         }
     }
 
-    if (client->error_code != 0 && (
-        client->error_code < 100 || client->error_code > 599
-        )) {
-        fprintf(stderr, "Invalid HTTP status: %d\n", client->error_code);
-        set_client_error(client, HTTP_500_INTERNAL_ERROR);
-    }
-
     if (client->error_code != 0) {
         if (!create_error_response(client, client->error_code)) {
             client->state = STATE_ERROR;
+            LOG_CLIENT(LOG_DEBUG, client, "state -> ERROR");
             return;
         }
     }
 
     client->state = STATE_WRITING;
+    LOG_CLIENT(LOG_DEBUG, client, "state -> ERROR");
+
+    LOG_CLIENT(LOG_INFO, client,
+        "response: %d (%d bytes, conn=%s)",
+        client->response.status_code, client->response.len, client->response.connection_close ? "close" : "keep-alive");
 }
 
 // ----------------------------------------------
@@ -939,12 +1000,8 @@ void handle_request(client_t* client, server_config_t* config) {
 void handle_write(client_t* client) {
     response_t* res = &client->response;
 
-    printf(">> write: response len = %d, sent = %d\n", res->len, res->sent);
-
-    printf(">> write: response:\n%.*s\n", res->len - res->sent, res->data + res->sent);
-
     while (res->sent < res->len) {
-        printf(">> write: len = %d, sent = %d\n", res->len, res->sent);
+        LOG_CLIENT(LOG_DEBUG, client, "write progress: %d/%d bytes", res->sent, res->len);
 
         // write next bytes
         ssize_t n = write(
@@ -953,13 +1010,14 @@ void handle_write(client_t* client) {
             res->len - res->sent
         );
 
-        printf(">> write: write() => %zd\n", n);
+        LOG_CLIENT(LOG_DEBUG, client, "wrote %zd bytes", n);
 
         if (n <= 0) {
             if (errno == EINTR) continue;
             else if (errno == EAGAIN || errno == EWOULDBLOCK) return;
             else {
                 client->state = STATE_ERROR;
+                LOG_CLIENT(LOG_DEBUG, client, "state -> ERROR");
                 return;
             }
         }
@@ -970,6 +1028,7 @@ void handle_write(client_t* client) {
 
     if (res->connection_close || client->peer_closed) {
         client->state = STATE_DONE;
+        LOG_CLIENT(LOG_DEBUG, client, "state -> DONE");
     }
     else {
         reset_client_for_next_request(client);
@@ -984,6 +1043,8 @@ void init_server_event_loop(server_config_t* config) {
     setup_signal_handlers();
 
     int server_fd = setup_server();
+
+    LOG(LOG_INFO, "Server is listening on port %d...", PORT);
 
     /**
      * At this point, the server is ready to accept connections.
@@ -1064,7 +1125,7 @@ void init_server_event_loop(server_config_t* config) {
              * This happens when SIGINT/SIGTERM is received.
              * Break out of the loop to allow graceful shutdown.
              */
-            if (errno != EINTR) perror("poll");
+            if (errno != EINTR) LOG_PERROR("poll");
             break;
         }
 
@@ -1076,7 +1137,7 @@ void init_server_event_loop(server_config_t* config) {
         for (int i = 1; i < nfds; i++) {
             long idle = now2 - clients[i].last_activity_ms;
             if (idle >= config->keep_alive_timeout_ms) {
-                printf("client timeout\n");
+                LOG_CLIENT(LOG_WARN, &clients[i], "timeout");
                 close_client(pfds, clients, &nfds, i);
                 i--;
             }
@@ -1092,7 +1153,7 @@ void init_server_event_loop(server_config_t* config) {
             if (pfds[i].fd == server_fd) {
                 if (!(pfds[i].revents & POLLIN)) continue;
 
-                printf("new connection\n");
+                LOG(LOG_INFO, "new connection");
                 /**
                  * What accept() does
                  *  1. Takes one connection from the queue
@@ -1109,18 +1170,18 @@ void init_server_event_loop(server_config_t* config) {
                     &client_addr_len
                 );
                 if (client_fd < 0) {
-                    if (errno != EINTR) perror("accept");
+                    if (errno != EINTR) LOG_PERROR("accept");
                     continue; // don't kill server, go to next connection
                 }
 
                 if (set_nonblocking(client_fd) < 0) {
-                    perror("fcntl failed");
+                    LOG_PERROR("fcnt failed");
                     close(client_fd);
                     continue;
                 }
 
                 if (nfds >= MAX_CLIENTS + 1) {
-                    printf("Too many clients, dropping connection\n");
+                    LOG(LOG_WARN, "too many clients, dropping connection");
                     close(client_fd);
                     continue;
                 }
@@ -1128,7 +1189,7 @@ void init_server_event_loop(server_config_t* config) {
                 int buffer_cap = 4096;
                 char* buffer = malloc(sizeof(char) * buffer_cap);
                 if (buffer == NULL) {
-                    printf("Failed to allocate request buffer\n");
+                    LOG(LOG_ERROR, "failed to allocate request buffer");
                     close(client_fd);
                     continue;
                 }
@@ -1137,6 +1198,7 @@ void init_server_event_loop(server_config_t* config) {
 
                 memset(&clients[nfds], 0, sizeof(client_t));
 
+                clients[nfds].id = next_client_id++;
                 clients[nfds].state = STATE_READING;
                 clients[nfds].fd = client_fd;
                 clients[nfds].addr = client_addr;
@@ -1165,9 +1227,8 @@ void init_server_event_loop(server_config_t* config) {
              * Socket error
              */
             if (pfds[i].revents & (POLLERR | POLLNVAL)) {
-                fprintf(stderr, "socket error: ");
-                if (pfds[i].revents & POLLERR) fprintf(stderr, "POLLERR\n");
-                else  fprintf(stderr, "POLLNVAL\n");
+                if (pfds[i].revents & POLLERR) LOG(LOG_ERROR, "socket error: POLLERR");
+                else LOG(LOG_ERROR, "socket error: POLLNVAL");
                 close_client(pfds, clients, &nfds, i);
                 i--;
                 continue;
@@ -1183,32 +1244,32 @@ void init_server_event_loop(server_config_t* config) {
              */
 
             client_t* client = &clients[i];
-
-            printf("client ready, state = %d\n", client->state);
+            LOG_CLIENT(LOG_DEBUG, client, "client ready");
 
             if (client->state == STATE_READING && (pfds[i].revents & POLLIN)) {
-                printf("client read\n");
+                LOG_CLIENT(LOG_DEBUG, client, "read ready");
                 handle_read(client);
             }
 
             if (client->state == STATE_HANDLING) {
-                printf("client handling\n");
+                LOG_CLIENT(LOG_DEBUG, client, "handling");
                 handle_request(client, config);
             }
 
             if (client->state == STATE_WRITING && (pfds[i].revents & POLLOUT)) {
-                printf("client write\n");
+                LOG_CLIENT(LOG_DEBUG, client, "write ready");
                 handle_write(client);
             }
 
             if (client->state == STATE_READING && client->buffer_len > 0 && !client->peer_closed) {
                 // try to parse next request immediately (pipeline)
+                LOG_CLIENT(LOG_DEBUG, client, "pipeline read");
                 handle_read(client);
             }
 
             if (client->state == STATE_READING && client->peer_closed && !(pfds[i].revents & POLLIN)) {
                 // no more data will come
-                printf("peer closed without full request\n");
+                LOG_CLIENT(LOG_DEBUG, client, "peer closed without full request");
                 close_client(pfds, clients, &nfds, i);
                 i--;
                 continue;
@@ -1216,10 +1277,10 @@ void init_server_event_loop(server_config_t* config) {
 
             if (client->state == STATE_DONE || client->state == STATE_ERROR) {
                 if (client->state == STATE_DONE) {
-                    printf("request done\n");
+                    LOG_CLIENT(LOG_DEBUG, client, "done");
                 }
                 else {
-                    fprintf(stderr, "request error\n");
+                    LOG_CLIENT(LOG_DEBUG, client, "error");
                 }
                 close_client(pfds, clients, &nfds, i);
                 i--;
@@ -1228,19 +1289,19 @@ void init_server_event_loop(server_config_t* config) {
         }
     }
 
-    /*
+    /**
      * Cleanup
      *
      * Close all open sockets (server and client sockets) and print shutdown message.
      * This code is now reachable thanks to the graceful shutdown
      * mechanism (signal_handler + poll() + keep_running).
      */
-    printf("\nShutting down server...\n");
+    LOG(LOG_INFO, "shutting down server...");
     for (int i = 0; i < nfds; i++) {
         close(pfds[i].fd);
         free_client(clients + i);
     }
-    printf("Server shutdown.\n");
+    LOG(LOG_INFO, "server shutdown.");
 }
 
 // ----------------------------------------------
