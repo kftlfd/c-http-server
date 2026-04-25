@@ -1,22 +1,43 @@
 /**
  * HTTP echo / static files server
- * - non-blocking I/O, client state machine
- * - HTTP/1.1 keep-alive, buffer reuse
- * - request parsing
- * - routing, static file serving
- * - request lifecycle, timeouts
- * - basic pipelining
+ * - non-blocking I/O (poll-based event loop)
+ * - per-client state machine (read -> handle -> write)
+ * - HTTP/1.1 keep-alive support
+ * - basic request parsing (request line + headers)
+ * - static file serving (GET + HEAD)
+ * - simple routing (/, .html fallback, index.html)
+ * - connection timeouts
+ * - basic pipelining support
  *
- * Known limitations:
- * - no "transfer-encoding"
- * - no streaming
- * - no caching
- * - ...
+  * Limitations:
+ * - only HTTP/1.1 (no HTTP/2, no TLS)
+ * - only GET+HEAD supported in fs mode (no POST, etc.)
+ * - no "Transfer-Encoding: chunked"
+ * - no request streaming (entire request buffered)
+ * - no response streaming (entire file buffered in memory)
+ * - no persistent caching (files read on each request)
+ * - limited MIME type detection
+ * - no range requests (partial content)
+ * - no directory listing
+ * - no URL decoding (%20 etc.)
+ * - strict path validation (may reject some valid URLs)
+ * - no concurrency beyond poll() (single-threaded)
+ * - fixed limits:
+ *     - max clients
+ *     - max request size
+ *     - max file size
+ *
+ * Security notes:
+ * - prevents directory traversal ("..")
+ * - restricts allowed path characters
+ * - does not follow symlinks explicitly (depends on stat)
+ * - not hardened for production use
  *
  * TODO:
- * - LRU cache for files
- * - sendfile(), streaming optimization
- * - ...
+ * - sendfile() / streaming responses for large files
+ * - LRU file cache
+ * - more complete MIME type handling
+ * - configuration (port, limits, timeouts)
  */
 
 #include <stdio.h>      // printf(), perror()
