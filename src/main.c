@@ -603,65 +603,100 @@ next_step: {
 }
 
 // ----------------------------------------------
+// Build response
+// ----------------------------------------------
+
+int response_build(
+    response_t* res,
+    http_status_t status_code,
+    const char* status_text,
+    const char* content_type,
+    const char* body,
+    int body_len,
+    int connection_close
+) {
+    int header_cap = 512;
+
+    int total_cap = header_cap + body_len;
+
+    res->data = malloc(total_cap);
+    if (!res->data) return 0;
+
+    const char* conn = connection_close ? "close" : "keep-alive";
+
+    int header_len = snprintf(
+        res->data,
+        header_cap,
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: %s\r\n"
+        "\r\n",
+        status_code,
+        status_text,
+        content_type ? content_type : "application/octet-stream",
+        body_len,
+        conn
+    );
+
+    if (header_len < 0 || header_len >= header_cap) {
+        free(res->data);
+        return 0;
+    }
+
+    if (body_len > 0 && body != NULL) {
+        memcpy(res->data + header_len, body, body_len);
+    }
+
+    res->len = header_len + body_len;
+    res->sent = 0;
+    res->connection_close = connection_close;
+
+    return 1;
+}
+
+int create_error_response(client_t* client, http_status_t code) {
+    const char* text = "Internal Server Error";
+
+    switch (code) {
+    case HTTP_400_BAD_REQUEST: text = "Bad Request"; break;
+    case HTTP_403_FORBIDDEN: text = "Forbidden"; break;
+    case HTTP_404_NOT_FOUND: text = "Not Found"; break;
+    case HTTP_405_NOT_ALLOWED: text = "Method Not Allowed"; break;
+    case HTTP_501_NOT_IMPLEMENTED: text = "Not Implemented"; break;
+    default: break;
+    }
+
+    return response_build(
+        &client->response,
+        code,
+        text,
+        "text/plain",
+        NULL,
+        0,
+        1 // always close on error
+    );
+}
+
+// ----------------------------------------------
 // Echo response
 // ----------------------------------------------
 
 void create_echo_response(client_t* client) {
-    char* conn = client->request.connection_close ? "close" : "keep-alive";
+    int body_len = client->request.content_len;
+    const char* body = client->request.body;
 
-    if (client->request.content_len == 0 || client->request.body == NULL) {
-        client->response.data = malloc(1024);
-        if (client->response.data == NULL) return set_client_error(client, HTTP_500_INTERNAL_ERROR);
+    if (!body) body_len = 0;
 
-        client->response.len = snprintf(
-            client->response.data,
-            1024,
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/plain\r\n"
-            "Content-Length: %d\r\n"
-            "Connection: %s\r\n"
-            "\r\n",
-            0,
-            conn
-        );
-
-        if (client->response.len < 0) {
-            fprintf(stderr, "write response: sprintf failed or truncated\n");
-            return set_client_error(client, HTTP_500_INTERNAL_ERROR);
-        }
-    }
-    else {
-        int body_len = client->request.content_len;
-
-        if (body_len > INT_MAX - 4096) return set_client_error(client, HTTP_400_BAD_REQUEST);
-
-        int response_cap = 4096 + body_len;
-        client->response.data = malloc(sizeof(char) * response_cap);
-
-        if (client->response.data == NULL) {
-            perror("allocate response");
-            return set_client_error(client, HTTP_500_INTERNAL_ERROR);
-        }
-
-        client->response.len = snprintf(
-            client->response.data,
-            response_cap,
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/plain\r\n"
-            "Content-Length: %d\r\n"
-            "Connection: %s\r\n"
-            "\r\n"
-            "%s",
-            body_len,
-            conn,
-            client->request.body
-        );
-
-        if (client->response.len < 0 || client->response.len >= response_cap) {
-            fprintf(stderr, "write response: sprintf failed or truncated\n");
-            return set_client_error(client, HTTP_500_INTERNAL_ERROR);
-        }
-    }
+    if (!response_build(
+        &client->response,
+        HTTP_200_OK,
+        "OK",
+        "text/plain",
+        body,
+        body_len,
+        client->request.connection_close
+    )) set_client_error(client, HTTP_500_INTERNAL_ERROR);
 }
 
 // ----------------------------------------------
@@ -814,55 +849,6 @@ int read_file(const char* path, char** out_buf, int* out_len) {
     return 1;
 }
 
-void create_empty_body_response(client_t* client, const char* status_code_message, int* ok) {
-    response_t* res = &client->response;
-
-    res->data = malloc(512);
-    if (!res->data) { *ok = 0; return; }
-
-    char* conn = client->request.connection_close ? "close" : "keep-alive";
-
-    int n = snprintf(res->data, 512,
-        "HTTP/1.1 %s\r\n"
-        "Content-Length: 0\r\n"
-        "Connection: %s\r\n"
-        "\r\n",
-        status_code_message,
-        conn
-    );
-    if (n < 0 || n >= 512) { *ok = 0; return; }
-
-    res->len = n;
-    res->sent = 0;
-    res->connection_close = client->request.connection_close;
-    *ok = 1;
-    return;
-}
-
-void create_400_bad_request_response(client_t* client, int* ok) {
-    return create_empty_body_response(client, "400 Bad Request", ok);
-}
-
-void create_403_forbidden_response(client_t* client, int* ok) {
-    return create_empty_body_response(client, "403 Forbidden", ok);
-}
-
-void create_404_not_found_response(client_t* client, int* ok) {
-    return create_empty_body_response(client, "404 Not Found", ok);
-}
-
-void create_405_invalid_method_response(client_t* client, int* ok) {
-    return create_empty_body_response(client, "405 Method Not Allowed", ok);
-}
-
-void create_500_internal_error_response(client_t* client, int* ok) {
-    return create_empty_body_response(client, "500 Internal Server Error", ok);
-}
-
-void create_501_not_implemented_response(client_t* client, int* ok) {
-    return create_empty_body_response(client, "501 Not Implemented", ok);
-}
-
 void create_fs_response(client_t* client, server_config_t* config) {
     if (
         strcmp(client->request.method, "GET") != 0
@@ -888,66 +874,17 @@ void create_fs_response(client_t* client, server_config_t* config) {
     }
 
     const char* mime = get_mime_type(resolved);
-    const char* conn = client->request.connection_close ? "close" : "keep-alive";
+    int is_head_req = strcmp(client->request.method, "HEAD") == 0;
 
-    if (strcmp(client->request.method, "HEAD") == 0) {
-        int header_cap = 512;
-        client->response.data = malloc(header_cap);
-        if (!client->response.data) {
-            free(file_data);
-            return set_client_error(client, HTTP_500_INTERNAL_ERROR);
-        }
-        int header_len = snprintf(client->response.data, header_cap,
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: %s\r\n"
-            "Content-Length: %d\r\n"
-            "Connection: %s\r\n"
-            "\r\n",
-            mime,
-            file_len,
-            conn
-        );
-        if (header_len <= 0 || header_len >= header_cap) {
-            free(file_data);
-            return set_client_error(client, HTTP_500_INTERNAL_ERROR);
-        }
-        client->response.len = header_len;
-        free(file_data);
-        return;
-    }
-
-    // allocate header + file
-    int header_cap = 1024;
-    int total_cap = header_cap + file_len;
-
-    client->response.data = malloc(total_cap);
-    if (!client->response.data) {
-        free(file_data);
-        return set_client_error(client, HTTP_500_INTERNAL_ERROR);
-    }
-
-    int header_len = snprintf(
-        client->response.data,
-        header_cap,
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: %s\r\n"
-        "Content-Length: %d\r\n"
-        "Connection: %s\r\n"
-        "\r\n",
+    if (!response_build(
+        &client->response,
+        HTTP_200_OK,
+        "OK",
         mime,
+        is_head_req ? NULL : file_data,
         file_len,
-        conn
-    );
-    if (header_len <= 0 || header_len >= header_cap) {
-        free(file_data);
-        free(client->response.data);
-        return set_client_error(client, HTTP_500_INTERNAL_ERROR);
-    }
-
-    // copy file after headers
-    memcpy(client->response.data + header_len, file_data, file_len);
-
-    client->response.len = header_len + file_len;
+        client->request.connection_close
+    )) set_client_error(client, HTTP_500_INTERNAL_ERROR);
 
     free(file_data);
     return;
@@ -958,8 +895,6 @@ void create_fs_response(client_t* client, server_config_t* config) {
 // ----------------------------------------------
 
 void handle_request(client_t* client, server_config_t* config) {
-    int ok = 1;
-
     if (client->error_code == 0) {
         if (config->mode == MODE_ECHO) {
             create_echo_response(client);
@@ -970,23 +905,13 @@ void handle_request(client_t* client, server_config_t* config) {
     }
 
     if (client->error_code > 399) {
-        client->request.connection_close = 1;
-
-        switch (client->error_code) {
-        case HTTP_400_BAD_REQUEST: create_400_bad_request_response(client, &ok); break;
-        case HTTP_403_FORBIDDEN: create_403_forbidden_response(client, &ok); break;
-        case HTTP_404_NOT_FOUND: create_404_not_found_response(client, &ok); break;
-        case HTTP_405_NOT_ALLOWED: create_405_invalid_method_response(client, &ok); break;
-
-        case HTTP_500_INTERNAL_ERROR: create_500_internal_error_response(client, &ok); break;
-        case HTTP_501_NOT_IMPLEMENTED: create_501_not_implemented_response(client, &ok); break;
-
-        default: create_500_internal_error_response(client, &ok); break;
+        if (!create_error_response(client, client->error_code)) {
+            client->state = STATE_ERROR;
+            return;
         }
     }
 
-    if (ok) client->state = STATE_WRITING;
-    else client->state = STATE_ERROR;
+    client->state = STATE_WRITING;
 }
 
 // ----------------------------------------------
