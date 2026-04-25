@@ -38,6 +38,7 @@
  * - LRU file cache
  * - more complete MIME type handling
  * - configuration (port, limits, timeouts)
+ * - `writev() + `struct iovec` (`<sys/uio.h>`) for concurrency-safe logs
  */
 
 #include <stdio.h>      // printf(), perror()
@@ -182,26 +183,46 @@ const char* state_str(client_state_t s) {
     }
 }
 
+const char* log_level_str(log_level_t level) {
+    switch (level) {
+    case LOG_L_DUMP: return "DUMP";
+    case LOG_L_DEBUG: return "DEBUG";
+    case LOG_L_INFO: return "INFO";
+    case LOG_L_WARN: return "WARN";
+    case LOG_L_ERROR: return "ERROR";
+    default: return "?";
+    }
+}
+
+void get_ts_local(struct timespec* ts, char* out, int out_len) {
+    struct tm tm;
+    localtime_r(&ts->tv_sec, &tm);
+
+    size_t n = strftime(out, out_len, "%Y-%m-%dT%H:%M:%S", &tm);
+    n += snprintf(out + n, out_len - n, ".%03ld", ts->tv_nsec / 1000000);
+    strftime(out + n, out_len - n, "%z", &tm);
+}
+
+void get_ts_utc(struct timespec* ts, char* out, int out_len) {
+    struct tm tm;
+    gmtime_r(&ts->tv_sec, &tm);
+
+    size_t n = strftime(out, out_len, "%Y-%m-%dT%H:%M:%S", &tm);
+    snprintf(out + n, out_len - n, ".%03ldZ", ts->tv_nsec / 1000000);
+}
+
 void log_msg(log_level_t level, const char* fmt, ...) {
     if (level < LOG_LEVEL) return;
 
-    const char* level_str =
-        (level == LOG_L_DUMP) ? "DUMP" :
-        (level == LOG_L_DEBUG) ? "DEBUG" :
-        (level == LOG_L_INFO) ? "INFO" :
-        (level == LOG_L_WARN) ? "WARN" :
-        "ERROR";
+    const char* level_str = log_level_str(level);
 
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
 
-    struct tm tm;
-    localtime_r(&ts.tv_sec, &tm); // gmtime_r or localtime_r
+    char time[64];
+    get_ts_local(&ts, time, 64);
 
-    char buf[32];
-    strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm);
-
-    fprintf(stderr, "[%s.%03ldZ] [%s]\t", buf, ts.tv_nsec / 1000000, level_str);
+    fprintf(stderr, "[%s] [%s]\t", time, level_str);
 
     va_list args;
     va_start(args, fmt);
@@ -238,7 +259,7 @@ void log_msg(log_level_t level, const char* fmt, ...) {
 #define LOG_CLIENT_ERROR(client, fmt, ...) LOG_CLIENT(LOG_L_ERROR, client, fmt, ##__VA_ARGS__)
 
 #define LOG_CLIENT_PERROR(client, fmt, ...) \
-    LOG_PERROR("[c=%d fd=%d req=%d state=%d]\t" fmt, \
+    LOG_PERROR("[c=%d fd=%d req=%d state=%s]\t" fmt, \
         (client)->id, (client)->fd, (client)->request_id, \
         state_str((client)->state), ##__VA_ARGS__)
 
