@@ -615,12 +615,16 @@ int response_build(
     int body_len,
     int connection_close
 ) {
-    int header_cap = 512;
+    printf("> build: status=%d, body_len=%d\n", status_code, body_len);
+
+    int header_cap = 1024;
 
     int total_cap = header_cap + body_len;
 
     res->data = malloc(total_cap);
     if (!res->data) return 0;
+
+    printf("> build: data allocated");
 
     const char* conn = connection_close ? "close" : "keep-alive";
 
@@ -638,6 +642,8 @@ int response_build(
         body_len,
         conn
     );
+
+    printf("> build: header_len=%d\n", header_len);
 
     if (header_len < 0 || header_len >= header_cap) {
         free(res->data);
@@ -904,7 +910,14 @@ void handle_request(client_t* client, server_config_t* config) {
         }
     }
 
-    if (client->error_code > 399) {
+    if (client->error_code != 0 && (
+        client->error_code < 100 || client->error_code > 599
+        )) {
+        fprintf(stderr, "Invalid HTTP status: %d\n", client->error_code);
+        set_client_error(client, HTTP_500_INTERNAL_ERROR);
+    }
+
+    if (client->error_code != 0) {
         if (!create_error_response(client, client->error_code)) {
             client->state = STATE_ERROR;
             return;
@@ -925,13 +938,21 @@ void handle_request(client_t* client, server_config_t* config) {
 void handle_write(client_t* client) {
     response_t* res = &client->response;
 
+    printf(">> write: response len = %d, sent = %d\n", res->len, res->sent);
+
+    printf(">> write: response:\n%.*s\n", res->len - res->sent, res->data + res->sent);
+
     while (res->sent < res->len) {
+        printf(">> write: len = %d, sent = %d\n", res->len, res->sent);
+
         // write next bytes
         ssize_t n = write(
             client->fd,
             res->data + res->sent,
             res->len - res->sent
         );
+
+        printf(">> write: write() => %zu\n", n);
 
         if (n <= 0) {
             if (errno == EINTR) continue;
@@ -1113,11 +1134,14 @@ void init_server_event_loop(server_config_t* config) {
 
                 pfds[nfds].fd = client_fd;
 
+                memset(&clients[nfds], 0, sizeof(client_t));
+
                 clients[nfds].state = STATE_READING;
                 clients[nfds].fd = client_fd;
                 clients[nfds].addr = client_addr;
                 clients[nfds].last_activity_ms = now_ms();
                 clients[nfds].peer_closed = 0;
+                clients[nfds].error_code = 0;
 
                 clients[nfds].buffer = buffer;
                 clients[nfds].buffer_len = 0;
