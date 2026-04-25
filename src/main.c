@@ -1,3 +1,24 @@
+/**
+ * HTTP echo / static files server
+ * - non-blocking I/O, client state machine
+ * - HTTP/1.1 keep-alive, buffer reuse
+ * - request parsing
+ * - routing, static file serving
+ * - request lifecycle, timeouts
+ * - basic pipelining
+ *
+ * Known limitations:
+ * - no "transfer-encoding"
+ * - no streaming
+ * - no caching
+ * - ...
+ *
+ * TODO:
+ * - LRU cache for files
+ * - sendfile(), streaming optimization
+ * - ...
+ */
+
 #include <stdio.h>      // printf(), perror()
 #include <stdlib.h>     // exit(), EXIT_FAILURE
 #include <string.h>     // memset()
@@ -10,6 +31,7 @@
 #include <limits.h>     // INT_MAX
 #include <fcntl.h>      // fcntl(), O_NONBLOCK
 #include <time.h>       // timespec, clock_gettime
+#include <sys/stat.h>  // stat()
 
 #define PORT 8080       // Port the server will listen on
 #define BACKLOG 10      // Max number of pending connections
@@ -18,13 +40,14 @@
 #define MAX_HEADERS_SIZE (16 * 1024) // 16 KB
 #define MAX_HEADERS_COUNT 100
 #define MAX_HEADER_LINE 2048
+#define MAX_FILE_SIZE (4 * 1024 * 1024) // 4 MB
 
-typedef enum {
+typedef enum ServerMode {
     MODE_ECHO,
     MODE_FS
 } server_mode_t;
 
-typedef struct {
+typedef struct ServerConfig {
     server_mode_t mode;
     char* fs_root;   // NULL for echo
     int keep_alive_timeout_ms;
@@ -536,7 +559,7 @@ next_step: {
 }
 
 // ----------------------------------------------
-// Create response
+// Echo response
 // ----------------------------------------------
 
 int create_echo_response(client_t* client) {
@@ -598,40 +621,253 @@ int create_echo_response(client_t* client) {
     return 1;
 }
 
-int create_fs_response(client_t* client, server_config_t* config) {
+// ----------------------------------------------
+// FS response
+// ----------------------------------------------
 
-    client->response = malloc(1024);
+int is_valid_path(const char* path) {
+    // not empty and starts with "/"
+    if (!path || strlen(path) < 1 || path[0] != '/') return 0;
+
+    // allow only safe characters
+    for (const char* p = path; *p; p++) {
+        char c = *p;
+        if (
+            !(c >= 'a' && c <= 'z')
+            && !(c >= 'A' && c <= 'Z')
+            && !(c >= '0' && c <= '9')
+            && c != '/'
+            && c != '.'
+            && c != '-'
+            && c != '_'
+            ) return 0;
+    }
+
+    // reject ".." and double slash
+    if (strstr(path, "..") || strstr(path, "//")) return 0;
+
+    return 1;
+}
+
+int file_exists(const char* path, int* is_dir) {
+    struct stat st;
+    if (stat(path, &st) < 0) return 0;
+    if (is_dir) *is_dir = S_ISDIR(st.st_mode);
+    if (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode)) return 1;
+    return 0;
+}
+
+int resolve_path(char* out, size_t cap, server_config_t* config, const char* url_path) {
+    char path[PATH_MAX];
+    int is_dir = 0;
+
+    // Case 1: "/"
+    if (url_path[0] == '/' && url_path[1] == '\0') {
+        snprintf(path, sizeof(path), "%s/index.html", config->fs_root);
+
+        if (file_exists(path, &is_dir) && !is_dir) {
+            snprintf(out, cap, "%s", path);
+            return 1;
+        }
+
+        return 0;
+    }
+
+    // build base path, strip leading '/'
+    const char* rel = url_path + 1;
+    snprintf(path, sizeof(path), "%s/%s", config->fs_root, rel);
+
+    // Case 2: ends with "/"
+    size_t len = strlen(url_path);
+    if (url_path[len - 1] == '/') {
+        char with_index[PATH_MAX];
+        snprintf(with_index, sizeof(with_index), "%s/index.html", path);
+
+        if (file_exists(with_index, &is_dir) && !is_dir) {
+            snprintf(out, cap, "%s", with_index);
+            return 1;
+        }
+
+        return 0;
+    }
+
+    // Case 3: try exact file
+    if (file_exists(path, &is_dir) && !is_dir) {
+        snprintf(out, cap, "%s", path);
+        return 1;
+    }
+
+    // Case 4: try ".html"
+    char with_html[PATH_MAX];
+    snprintf(with_html, sizeof(with_html), "%s.html", path);
+    if (file_exists(with_html, &is_dir) && !is_dir) {
+        snprintf(out, cap, "%s", with_html);
+        return 1;
+    }
+
+    // Case 5: try directory index
+    char with_index[PATH_MAX];
+    snprintf(with_index, sizeof(with_index), "%s/index.html", path);
+    printf("%s\n", with_index);
+    if (file_exists(with_index, &is_dir) && !is_dir) {
+        snprintf(out, cap, "%s", with_index);
+        return 1;
+    }
+
+    return 0;
+}
+
+const char* get_mime_type(const char* path) {
+    const char* ext = strrchr(path, '.');
+    if (!ext) return "application/octet-stream";
+
+    ext++; // skip '.'
+
+    if (strcasecmp(ext, "html") == 0) return "text/html";
+    if (strcasecmp(ext, "css") == 0) return "text/css";
+    if (strcasecmp(ext, "js") == 0) return "application/javascript";
+    if (strcasecmp(ext, "png") == 0) return "image/png";
+    if (strcasecmp(ext, "jpg") == 0 || strcasecmp(ext, "jpeg") == 0) return "image/jpeg";
+    if (strcasecmp(ext, "gif") == 0) return "image/gif";
+    if (strcasecmp(ext, "txt") == 0) return "text/plain";
+
+    return "application/octet-stream";
+};
+
+int read_file(const char* path, char** out_buf, int* out_len) {
+    struct stat st;
+    if (stat(path, &st) < 0) return 0;
+
+    if (!S_ISREG(st.st_mode)) return 0;
+
+    if (st.st_size < 0 || st.st_size > MAX_FILE_SIZE) return 0;
+
+    int size = (int)st.st_size;
+
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+
+    char* buf = malloc(size);
+    if (!buf) { fclose(f); return 0; }
+
+    int read_bytes = fread(buf, 1, size, f);
+    fclose(f);
+
+    if (read_bytes != size) { free(buf); return 0; }
+
+    *out_buf = buf;
+    *out_len = size;
+    return 1;
+}
+
+int create_empty_body_response(client_t* client, const char* status_code_message) {
+    client->response = malloc(512);
     if (!client->response) return 0;
-
-    char* response_body = malloc(1024);
-    if (!response_body) return 0;
-
-    int body_len = snprintf(response_body, 1024,
-        "Not implemented\n"
-        "Serving files from %s\n",
-        config->fs_root
-    );
-    if (body_len < 1) { free(response_body); return 0; }
 
     char* conn = client->request.connection_close ? "close" : "keep-alive";
 
-    int n = snprintf(client->response, 1024,
-        "HTTP/1.1 501 Not Implemented\r\n"
-        "Content-Type: text/plain\r\n"
-        "Content-Length: %d\r\n"
+    int n = snprintf(client->response, 512,
+        "HTTP/1.1 %s\r\n"
+        "Content-Length: 0\r\n"
         "Connection: %s\r\n"
-        "\r\n"
-        "%s",
-        body_len,
-        conn,
-        response_body
+        "\r\n",
+        status_code_message,
+        conn
     );
-    if (n < 1) { free(response_body); return 0; }
+    if (n < 1) { return 0; }
 
     client->response_len = n;
-    free(response_body);
     return 1;
 }
+
+int create_400_bad_request_response(client_t* client) {
+    return create_empty_body_response(client, "400 Bad Request");
+}
+
+int create_403_forbidden_response(client_t* client) {
+    return create_empty_body_response(client, "403 Forbidden");
+}
+
+int create_404_not_found_response(client_t* client) {
+    return create_empty_body_response(client, "404 Not Found");
+}
+
+int create_405_invalid_method_response(client_t* client) {
+    return create_empty_body_response(client, "405 Method Not Allowed");
+}
+
+int create_500_internal_error_response(client_t* client) {
+    return create_empty_body_response(client, "500 Internal Server Error");
+}
+
+int create_501_not_implemented_response(client_t* client) {
+    return create_empty_body_response(client, "501 Not Implemented");
+}
+
+int create_fs_response(client_t* client, server_config_t* config) {
+    if (strcmp(client->request.method, "GET") != 0) {
+        return create_405_invalid_method_response(client);
+    }
+    if (!is_valid_path(client->request.path)) {
+        return create_400_bad_request_response(client);
+    }
+
+    char resolved[PATH_MAX];
+
+    if (!resolve_path(resolved, sizeof(resolved), config, client->request.path)) {
+        return create_404_not_found_response(client);
+    }
+
+    char* file_data = NULL;
+    int file_len = 0;
+
+    if (!read_file(resolved, &file_data, &file_len)) {
+        return create_403_forbidden_response(client);
+    }
+
+    const char* mime = get_mime_type(resolved);
+    const char* conn = client->request.connection_close ? "close" : "keep-alive";
+
+    // allocate header + file
+    int header_cap = 1024;
+    int total_cap = header_cap + file_len;
+
+    client->response = malloc(total_cap);
+    if (!client->response) {
+        free(file_data);
+        return 0;
+    }
+
+    int header_len = snprintf(
+        client->response,
+        header_cap,
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: %s\r\n"
+        "\r\n",
+        mime,
+        file_len,
+        conn
+    );
+    if (header_len <= 0 || header_len >= header_cap) {
+        free(file_data);
+        free(client->response);
+        return 0;
+    }
+
+    // copy file after headers
+    memcpy(client->response + header_len, file_data, file_len);
+
+    client->response_len = header_len + file_len;
+
+    free(file_data);
+    return 1;
+}
+
+// ----------------------------------------------
+// Handle request
+// ----------------------------------------------
 
 void handle_request(client_t* client, server_config_t* config) {
     int ok = 0;
@@ -973,6 +1209,11 @@ int main(int argc, char** argv) {
         config.fs_root = strdup(argv[2]);
         if (!config.fs_root) {
             perror("fs_root strdup");
+            exit(1);
+        }
+        struct stat st;
+        if (stat(config.fs_root, &st) < 0 || !S_ISDIR(st.st_mode)) {
+            fprintf(stderr, "Invalid dir: %s\n", config.fs_root);
             exit(1);
         }
     }
