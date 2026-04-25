@@ -703,13 +703,16 @@ int file_exists(const char* path, int* is_dir) {
 int resolve_path(char* out, size_t cap, server_config_t* config, const char* url_path) {
     char path[PATH_MAX];
     int is_dir = 0;
+    int n = 0;
 
     // Case 1: "/"
     if (url_path[0] == '/' && url_path[1] == '\0') {
-        if (snprintf(path, sizeof(path), "%s/index.html", config->fs_root) >= sizeof(path)) return 0;
+        n = snprintf(path, sizeof(path), "%s/index.html", config->fs_root);
+        if (n < 0 || (size_t)n >= sizeof(path)) return 0;
 
         if (file_exists(path, &is_dir) && !is_dir) {
-            if (snprintf(out, cap, "%s", path) >= cap) return 0;
+            int n = snprintf(out, cap, "%s", path);
+            if (n < 0 || (size_t)n >= cap) return 0;
             return 1;
         }
 
@@ -718,16 +721,19 @@ int resolve_path(char* out, size_t cap, server_config_t* config, const char* url
 
     // build base path, strip leading '/'
     const char* rel = url_path + 1;
-    if (snprintf(path, sizeof(path), "%s/%s", config->fs_root, rel) >= sizeof(path)) return 0;
+    n = snprintf(path, sizeof(path), "%s/%s", config->fs_root, rel);
+    if (n < 0 || (size_t)n >= sizeof(path)) return 0;
 
     // Case 2: ends with "/"
     size_t len = strlen(url_path);
     if (url_path[len - 1] == '/') {
         char with_index[PATH_MAX];
-        if (snprintf(with_index, sizeof(with_index), "%s/index.html", path) >= sizeof(with_index)) return 0;
+        n = snprintf(with_index, sizeof(with_index), "%s/index.html", path);
+        if (n < 0 || (size_t)n >= sizeof(with_index)) return 0;
 
         if (file_exists(with_index, &is_dir) && !is_dir) {
-            if (snprintf(out, cap, "%s", with_index) >= cap) return 0;
+            n = snprintf(out, cap, "%s", with_index);
+            if (n < 0 || (size_t)n >= cap) return 0;
             return 1;
         }
 
@@ -736,24 +742,29 @@ int resolve_path(char* out, size_t cap, server_config_t* config, const char* url
 
     // Case 3: try exact file
     if (file_exists(path, &is_dir) && !is_dir) {
-        if (snprintf(out, cap, "%s", path) >= cap) return 0;
+        n = snprintf(out, cap, "%s", path);
+        if (n < 0 || (size_t)n >= cap) return 0;
         return 1;
     }
 
     // Case 4: try ".html"
     char with_html[PATH_MAX];
-    if (snprintf(with_html, sizeof(with_html), "%s.html", path) >= sizeof(with_html)) return 0;
+    n = snprintf(with_html, sizeof(with_html), "%s.html", path);
+    if (n < 0 || (size_t)n >= sizeof(with_html)) return 0;
     if (file_exists(with_html, &is_dir) && !is_dir) {
-        if (snprintf(out, cap, "%s", with_html) >= cap) return 0;
+        n = snprintf(out, cap, "%s", with_html);
+        if (n < 0 || (size_t)n >= cap) return 0;
         return 1;
     }
 
     // Case 5: try directory index
     char with_index[PATH_MAX];
-    if (snprintf(with_index, sizeof(with_index), "%s/index.html", path) >= sizeof(with_index)) return 0;
+    n = snprintf(with_index, sizeof(with_index), "%s/index.html", path);
+    if (n < 0 || (size_t)n >= sizeof(with_index)) return 0;
     printf("%s\n", with_index);
     if (file_exists(with_index, &is_dir) && !is_dir) {
-        if (snprintf(out, cap, "%s", with_index) >= cap) return 0;
+        n = snprintf(out, cap, "%s", with_index);
+        if (n < 0 || (size_t)n >= cap) return 0;
         return 1;
     }
 
@@ -819,7 +830,7 @@ void create_empty_body_response(client_t* client, const char* status_code_messag
         status_code_message,
         conn
     );
-    if (n < 1) { *ok = 0; return; }
+    if (n < 0 || n >= 512) { *ok = 0; return; }
 
     res->len = n;
     res->sent = 0;
@@ -879,7 +890,7 @@ void create_fs_response(client_t* client, server_config_t* config) {
     const char* mime = get_mime_type(resolved);
     const char* conn = client->request.connection_close ? "close" : "keep-alive";
 
-    if (strcmp(client->request.method, "HEAD") != 0) {
+    if (strcmp(client->request.method, "HEAD") == 0) {
         int header_cap = 512;
         client->response.data = malloc(header_cap);
         if (!client->response.data) {
@@ -947,14 +958,16 @@ void create_fs_response(client_t* client, server_config_t* config) {
 // ----------------------------------------------
 
 void handle_request(client_t* client, server_config_t* config) {
-    if (config->mode == MODE_ECHO) {
-        create_echo_response(client);
-    }
-    else {
-        create_fs_response(client, config);
-    }
-
     int ok = 1;
+
+    if (client->error_code == 0) {
+        if (config->mode == MODE_ECHO) {
+            create_echo_response(client);
+        }
+        else {
+            create_fs_response(client, config);
+        }
+    }
 
     if (client->error_code > 399) {
         client->request.connection_close = 1;
