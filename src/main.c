@@ -1,3 +1,24 @@
+/**
+ * HTTP echo / static files server
+ * - non-blocking I/O, client state machine
+ * - HTTP/1.1 keep-alive, buffer reuse
+ * - request parsing
+ * - routing, static file serving
+ * - request lifecycle, timeouts
+ * - basic pipelining
+ *
+ * Known limitations:
+ * - no "transfer-encoding"
+ * - no streaming
+ * - no caching
+ * - ...
+ *
+ * TODO:
+ * - LRU cache for files
+ * - sendfile(), streaming optimization
+ * - ...
+ */
+
 #include <stdio.h>      // printf(), perror()
 #include <stdlib.h>     // exit(), EXIT_FAILURE
 #include <string.h>     // memset()
@@ -697,100 +718,90 @@ int resolve_path(char* out, size_t cap, server_config_t* config, const char* url
 }
 
 const char* get_mime_type(const char* path) {
-    // strrchr(path, '.');
-    (void)path;
-    return "";
+    const char* ext = strrchr(path, '.');
+    if (!ext) return "application/octet-stream";
+
+    ext++; // skip '.'
+
+    if (strcasecmp(ext, "html") == 0) return "text/html";
+    if (strcasecmp(ext, "css") == 0) return "text/css";
+    if (strcasecmp(ext, "js") == 0) return "application/javascript";
+    if (strcasecmp(ext, "png") == 0) return "image/png";
+    if (strcasecmp(ext, "jpg") == 0 || strcasecmp(ext, "jpeg") == 0) return "image/jpeg";
+    if (strcasecmp(ext, "gif") == 0) return "image/gif";
+    if (strcasecmp(ext, "txt") == 0) return "text/plain";
+
+    return "application/octet-stream";
 };
 
-int create_400_bad_request_response(client_t* client) {
+int read_file(const char* path, char** out_buf, int* out_len) {
+    struct stat st;
+    if (stat(path, &st) < 0) return 0;
+
+    if (!S_ISREG(st.st_mode)) return 0;
+
+    if (st.st_size < 0 || st.st_size > MAX_FILE_SIZE) return 0;
+
+    int size = (int)st.st_size;
+
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+
+    char* buf = malloc(size);
+    if (!buf) { fclose(f); return 0; }
+
+    int read_bytes = fread(buf, 1, size, f);
+    fclose(f);
+
+    if (read_bytes != size) { free(buf); return 0; }
+
+    *out_buf = buf;
+    *out_len = size;
+    return 1;
+}
+
+int create_empty_body_response(client_t* client, const char* status_code_message) {
     client->response = malloc(512);
     if (!client->response) return 0;
 
     char* conn = client->request.connection_close ? "close" : "keep-alive";
 
     int n = snprintf(client->response, 512,
-        "HTTP/1.1 400 Bad Request\r\n"
+        "HTTP/1.1 %s\r\n"
         "Content-Length: 0\r\n"
         "Connection: %s\r\n"
         "\r\n",
+        status_code_message,
         conn
     );
     if (n < 1) { return 0; }
 
     client->response_len = n;
     return 1;
+}
+
+int create_400_bad_request_response(client_t* client) {
+    return create_empty_body_response(client, "400 Bad Request");
+}
+
+int create_403_forbidden_response(client_t* client) {
+    return create_empty_body_response(client, "403 Forbidden");
 }
 
 int create_404_not_found_response(client_t* client) {
-    client->response = malloc(512);
-    if (!client->response) return 0;
-
-    char* conn = client->request.connection_close ? "close" : "keep-alive";
-
-    int n = snprintf(client->response, 512,
-        "HTTP/1.1 404 Not Found\r\n"
-        "Content-Length: 0\r\n"
-        "Connection: %s\r\n"
-        "\r\n",
-        conn
-    );
-    if (n < 1) { return 0; }
-
-    client->response_len = n;
-    return 1;
+    return create_empty_body_response(client, "404 Not Found");
 }
 
 int create_405_invalid_method_response(client_t* client) {
-    client->response = malloc(512);
-    if (!client->response) return 0;
-
-    char* conn = client->request.connection_close ? "close" : "keep-alive";
-
-    int n = snprintf(client->response, 512,
-        "HTTP/1.1 405 Method Not Allowed\r\n"
-        "Content-Length: 0\r\n"
-        "Connection: %s\r\n"
-        "\r\n",
-        conn
-    );
-    if (n < 1) { return 0; }
-
-    client->response_len = n;
-    return 1;
+    return create_empty_body_response(client, "405 Method Not Allowed");
 }
 
-int create_501_not_implemented_response(client_t* client, server_config_t* config) {
-    client->response = malloc(1024);
-    if (!client->response) return 0;
+int create_500_internal_error_response(client_t* client) {
+    return create_empty_body_response(client, "500 Internal Server Error");
+}
 
-    char* response_body = malloc(1024);
-    if (!response_body) return 0;
-
-    int body_len = snprintf(response_body, 1024,
-        "Not implemented\n"
-        "Serving files from %s\n",
-        config->fs_root
-    );
-    if (body_len < 1) { free(response_body); return 0; }
-
-    char* conn = client->request.connection_close ? "close" : "keep-alive";
-
-    int n = snprintf(client->response, 1024,
-        "HTTP/1.1 501 Not Implemented\r\n"
-        "Content-Type: text/plain\r\n"
-        "Content-Length: %d\r\n"
-        "Connection: %s\r\n"
-        "\r\n"
-        "%s",
-        body_len,
-        conn,
-        response_body
-    );
-    if (n < 1) { free(response_body); return 0; }
-
-    client->response_len = n;
-    free(response_body);
-    return 1;
+int create_501_not_implemented_response(client_t* client) {
+    return create_empty_body_response(client, "501 Not Implemented");
 }
 
 int create_fs_response(client_t* client, server_config_t* config) {
@@ -807,7 +818,51 @@ int create_fs_response(client_t* client, server_config_t* config) {
         return create_404_not_found_response(client);
     }
 
-    return create_501_not_implemented_response(client, config);
+    char* file_data = NULL;
+    int file_len = 0;
+
+    if (!read_file(resolved, &file_data, &file_len)) {
+        return create_403_forbidden_response(client);
+    }
+
+    const char* mime = get_mime_type(resolved);
+    const char* conn = client->request.connection_close ? "close" : "keep-alive";
+
+    // allocate header + file
+    int header_cap = 1024;
+    int total_cap = header_cap + file_len;
+
+    client->response = malloc(total_cap);
+    if (!client->response) {
+        free(file_data);
+        return 0;
+    }
+
+    int header_len = snprintf(
+        client->response,
+        header_cap,
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: %s\r\n"
+        "\r\n",
+        mime,
+        file_len,
+        conn
+    );
+    if (header_len <= 0 || header_len >= header_cap) {
+        free(file_data);
+        free(client->response);
+        return 0;
+    }
+
+    // copy file after headers
+    memcpy(client->response + header_len, file_data, file_len);
+
+    client->response_len = header_len + file_len;
+
+    free(file_data);
+    return 1;
 }
 
 // ----------------------------------------------
