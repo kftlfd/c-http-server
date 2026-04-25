@@ -628,12 +628,77 @@ int is_valid_path(const char* path) {
     return 1;
 }
 
+int file_exists(const char* path, int* is_dir) {
+    struct stat st;
+    if (stat(path, &st) < 0) return 0;
+    if (is_dir) *is_dir = S_ISDIR(st.st_mode);
+    if (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode)) return 1;
+    return 0;
+}
+
 int resolve_path(char* out, size_t cap, server_config_t* config, const char* url_path) {
+    char path[PATH_MAX];
+    int is_dir = 0;
+
+    // Case 1: "/"
+    if (url_path[0] == '/' && url_path[1] == '\0') {
+        snprintf(path, sizeof(path), "%s/index.html", config->fs_root);
+
+        if (file_exists(path, &is_dir) && !is_dir) {
+            snprintf(out, cap, "%s", path);
+            return 1;
+        }
+
+        return 0;
+    }
+
+    // build base path, strip leading '/'
+    const char* rel = url_path + 1;
+    snprintf(path, sizeof(path), "%s/%s", config->fs_root, rel);
+
+    // Case 2: ends with "/"
+    size_t len = strlen(url_path);
+    if (url_path[len - 1] == '/') {
+        char with_index[PATH_MAX];
+        snprintf(with_index, sizeof(with_index), "%s/index.html", path);
+
+        if (file_exists(with_index, &is_dir) && !is_dir) {
+            snprintf(out, cap, "%s", with_index);
+            return 1;
+        }
+
+        return 0;
+    }
+
+    // Case 3: try exact file
+    if (file_exists(path, &is_dir) && !is_dir) {
+        snprintf(out, cap, "%s", path);
+        return 1;
+    }
+
+    // Case 4: try ".html"
+    char with_html[PATH_MAX];
+    snprintf(with_html, sizeof(with_html), "%s.html", path);
+    if (file_exists(with_html, &is_dir) && !is_dir) {
+        snprintf(out, cap, "%s", with_html);
+        return 1;
+    }
+
+    // Case 5: try directory index
+    char with_index[PATH_MAX];
+    snprintf(with_index, sizeof(with_index), "%s/index.html", path);
+    printf("%s\n", with_index);
+    if (file_exists(with_index, &is_dir) && !is_dir) {
+        snprintf(out, cap, "%s", with_index);
+        return 1;
+    }
+
     return 0;
 }
 
 const char* get_mime_type(const char* path) {
     // strrchr(path, '.');
+    (void)path;
     return "";
 };
 
@@ -645,6 +710,25 @@ int create_400_bad_request_response(client_t* client) {
 
     int n = snprintf(client->response, 512,
         "HTTP/1.1 400 Bad Request\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: %s\r\n"
+        "\r\n",
+        conn
+    );
+    if (n < 1) { return 0; }
+
+    client->response_len = n;
+    return 1;
+}
+
+int create_404_not_found_response(client_t* client) {
+    client->response = malloc(512);
+    if (!client->response) return 0;
+
+    char* conn = client->request.connection_close ? "close" : "keep-alive";
+
+    int n = snprintf(client->response, 512,
+        "HTTP/1.1 404 Not Found\r\n"
         "Content-Length: 0\r\n"
         "Connection: %s\r\n"
         "\r\n",
@@ -675,14 +759,7 @@ int create_405_invalid_method_response(client_t* client) {
     return 1;
 }
 
-int create_fs_response(client_t* client, server_config_t* config) {
-    if (strcmp(client->request.method, "GET") != 0) {
-        return create_405_invalid_method_response(client);
-    }
-    if (!is_valid_path(client->request.path)) {
-        return create_400_bad_request_response(client);
-    }
-
+int create_501_not_implemented_response(client_t* client, server_config_t* config) {
     client->response = malloc(1024);
     if (!client->response) return 0;
 
@@ -714,6 +791,23 @@ int create_fs_response(client_t* client, server_config_t* config) {
     client->response_len = n;
     free(response_body);
     return 1;
+}
+
+int create_fs_response(client_t* client, server_config_t* config) {
+    if (strcmp(client->request.method, "GET") != 0) {
+        return create_405_invalid_method_response(client);
+    }
+    if (!is_valid_path(client->request.path)) {
+        return create_400_bad_request_response(client);
+    }
+
+    char resolved[PATH_MAX];
+
+    if (!resolve_path(resolved, sizeof(resolved), config, client->request.path)) {
+        return create_404_not_found_response(client);
+    }
+
+    return create_501_not_implemented_response(client, config);
 }
 
 // ----------------------------------------------
