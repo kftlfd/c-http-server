@@ -500,6 +500,7 @@ void handle_read(client_t* client) {
 
             if (want_end > write_pos) {
                 size_t remaining = want_end - write_pos;
+                if (remaining < 0) remaining = 0;
                 if (remaining < read_bytes) read_bytes = remaining;
             }
             else {
@@ -952,7 +953,7 @@ void handle_write(client_t* client) {
             res->len - res->sent
         );
 
-        printf(">> write: write() => %zu\n", n);
+        printf(">> write: write() => %zd\n", n);
 
         if (n <= 0) {
             if (errno == EINTR) continue;
