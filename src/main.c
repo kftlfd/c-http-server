@@ -82,6 +82,16 @@ typedef enum ClientState {
     STATE_ERROR
 } client_state_t;
 
+typedef enum HttpStatus {
+    HTTP_200_OK = 200,
+    HTTP_400_BAD_REQUEST = 400,
+    HTTP_403_FORBIDDEN = 403,
+    HTTP_404_NOT_FOUND = 404,
+    HTTP_405_NOT_ALLOWED = 405,
+    HTTP_500_INTERNAL_ERROR = 500,
+    HTTP_501_NOT_IMPLEMENTED = 501
+} http_status_t;
+
 typedef struct Request {
     int headers_len;
     int body_len;
@@ -111,6 +121,7 @@ typedef struct Client {
     struct sockaddr_in addr;
     long last_activity_ms;
     int peer_closed;
+    http_status_t error_code;
 
     char* buffer;
     int buffer_len;
@@ -328,6 +339,11 @@ void close_client(pollfd_t* pfds, client_t* clients, int* nfds, int i) {
     (*nfds)--;
 }
 
+void set_client_error(client_t* client, http_status_t status_code) {
+    client->error_code = status_code;
+    client->state = STATE_HANDLING;
+}
+
 // ----------------------------------------------
 // Read request
 // ----------------------------------------------
@@ -403,7 +419,7 @@ int parse_request_headers(client_t* client) {
                 }
             }
             else if (strcasecmp(key, "transfer-encoding") == 0) {
-                return 0; // not supported
+                return -1; // not supported
             }
         }
 
@@ -448,6 +464,7 @@ void reset_client_for_next_request(client_t* client) {
 
     client->last_activity_ms = now_ms();
     client->state = STATE_READING;
+    client->error_code = 0;
 }
 
 /**
@@ -460,12 +477,12 @@ void handle_read(client_t* client) {
          * grow buffer if needed
          */
         if (client->buffer_len + 1 >= client->buffer_cap) {
-            if (client->buffer_cap > MAX_REQUEST_SIZE / 2) goto err_next;
+            if (client->buffer_cap > MAX_REQUEST_SIZE / 2) return set_client_error(client, HTTP_400_BAD_REQUEST);
             client->buffer_cap *= 2;
             int body_offset = -1;
             if (client->request.body != NULL) body_offset = client->request.body - client->buffer;
             char* tmp = realloc(client->buffer, client->buffer_cap);
-            if (tmp == NULL) goto err_next;
+            if (tmp == NULL) return set_client_error(client, HTTP_500_INTERNAL_ERROR);
             client->buffer = tmp;
             if (body_offset >= 0) client->request.body = client->buffer + body_offset;
         }
@@ -495,7 +512,7 @@ void handle_read(client_t* client) {
 
         if (read_bytes == 0) {
             if (client->headers_done) goto next_step;
-            else goto err_next;
+            else return set_client_error(client, HTTP_400_BAD_REQUEST);
         }
 
         ssize_t n = read(client->fd, write_pos, read_bytes);
@@ -504,10 +521,10 @@ void handle_read(client_t* client) {
             if (errno == EINTR) continue;
             else if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 // If peer already closed, no more data will come
-                if (client->peer_closed) goto err_next;
+                if (client->peer_closed) return set_client_error(client, HTTP_400_BAD_REQUEST);
                 break;
             }
-            else goto err_next;
+            else set_client_error(client, HTTP_400_BAD_REQUEST);
         }
 
         /**
@@ -523,7 +540,7 @@ void handle_read(client_t* client) {
             }
 
             // Case 2: partial request -> error
-            if (!client->headers_done) goto err_next;
+            if (!client->headers_done) return set_client_error(client, HTTP_400_BAD_REQUEST);
 
             // Case 3: headers done, check body
             // If no body expected OR already fully read -> OK
@@ -533,7 +550,7 @@ void handle_read(client_t* client) {
             }
             if (body_received >= client->request.content_len) goto next_step;
 
-            goto err_next;
+            return set_client_error(client, HTTP_400_BAD_REQUEST);
         };
 
         client->buffer_len += n;
@@ -542,7 +559,7 @@ void handle_read(client_t* client) {
 
         if (!client->headers_done && client->buffer_len > MAX_HEADERS_SIZE) {
             fprintf(stderr, "Headers too large\n");
-            goto err_next;
+            return set_client_error(client, HTTP_400_BAD_REQUEST);
         }
 
         // check for headers end
@@ -557,7 +574,9 @@ void handle_read(client_t* client) {
                 client->request.headers_len = headers_len;
                 client->request.body = headers_end + 4;
 
-                if (!parse_request_headers(client)) goto err_next;
+                int ok = parse_request_headers(client);
+                if (ok < 0) return set_client_error(client, HTTP_405_NOT_ALLOWED);
+                if (ok < 1) return set_client_error(client, HTTP_400_BAD_REQUEST);
             }
         }
 
@@ -568,8 +587,6 @@ void handle_read(client_t* client) {
         }
     }
     return;
-
-err_next: { client->state = STATE_ERROR; return; }
 
 next_step: {
     printf(
@@ -582,19 +599,19 @@ next_step: {
 
     client->state = STATE_HANDLING;
     return;
-}
+    }
 }
 
 // ----------------------------------------------
 // Echo response
 // ----------------------------------------------
 
-int create_echo_response(client_t* client) {
+void create_echo_response(client_t* client) {
     char* conn = client->request.connection_close ? "close" : "keep-alive";
 
     if (client->request.content_len == 0 || client->request.body == NULL) {
         client->response.data = malloc(1024);
-        if (client->response.data == NULL) return 1;
+        if (client->response.data == NULL) return set_client_error(client, HTTP_500_INTERNAL_ERROR);
 
         client->response.len = snprintf(
             client->response.data,
@@ -610,20 +627,20 @@ int create_echo_response(client_t* client) {
 
         if (client->response.len < 0) {
             fprintf(stderr, "write response: sprintf failed or truncated\n");
-            return 0;
+            return set_client_error(client, HTTP_500_INTERNAL_ERROR);
         }
     }
     else {
         int body_len = client->request.content_len;
 
-        if (body_len > INT_MAX - 4096) return 0;
+        if (body_len > INT_MAX - 4096) return set_client_error(client, HTTP_400_BAD_REQUEST);
 
         int response_cap = 4096 + body_len;
         client->response.data = malloc(sizeof(char) * response_cap);
 
         if (client->response.data == NULL) {
             perror("allocate response");
-            return 0;
+            return set_client_error(client, HTTP_500_INTERNAL_ERROR);
         }
 
         client->response.len = snprintf(
@@ -642,10 +659,9 @@ int create_echo_response(client_t* client) {
 
         if (client->response.len < 0 || client->response.len >= response_cap) {
             fprintf(stderr, "write response: sprintf failed or truncated\n");
-            return 0;
+            return set_client_error(client, HTTP_500_INTERNAL_ERROR);
         }
     }
-    return 1;
 }
 
 // ----------------------------------------------
@@ -787,11 +803,11 @@ int read_file(const char* path, char** out_buf, int* out_len) {
     return 1;
 }
 
-int create_empty_body_response(client_t* client, const char* status_code_message) {
+void create_empty_body_response(client_t* client, const char* status_code_message, int* ok) {
     response_t* res = &client->response;
 
     res->data = malloc(512);
-    if (!res->data) return 0;
+    if (!res->data) { *ok = 0; return; }
 
     char* conn = client->request.connection_close ? "close" : "keep-alive";
 
@@ -803,66 +819,61 @@ int create_empty_body_response(client_t* client, const char* status_code_message
         status_code_message,
         conn
     );
-    if (n < 1) { return 0; }
+    if (n < 1) { *ok = 0; return; }
 
     res->len = n;
     res->sent = 0;
     res->connection_close = client->request.connection_close;
-    return 1;
+    *ok = 1;
+    return;
 }
 
-int create_400_bad_request_response(client_t* client) {
-    client->request.connection_close = 1;
-    return create_empty_body_response(client, "400 Bad Request");
+void create_400_bad_request_response(client_t* client, int* ok) {
+    return create_empty_body_response(client, "400 Bad Request", ok);
 }
 
-int create_403_forbidden_response(client_t* client) {
-    client->request.connection_close = 1;
-    return create_empty_body_response(client, "403 Forbidden");
+void create_403_forbidden_response(client_t* client, int* ok) {
+    return create_empty_body_response(client, "403 Forbidden", ok);
 }
 
-int create_404_not_found_response(client_t* client) {
-    client->request.connection_close = 1;
-    return create_empty_body_response(client, "404 Not Found");
+void create_404_not_found_response(client_t* client, int* ok) {
+    return create_empty_body_response(client, "404 Not Found", ok);
 }
 
-int create_405_invalid_method_response(client_t* client) {
-    client->request.connection_close = 1;
-    return create_empty_body_response(client, "405 Method Not Allowed");
+void create_405_invalid_method_response(client_t* client, int* ok) {
+    return create_empty_body_response(client, "405 Method Not Allowed", ok);
 }
 
-int create_500_internal_error_response(client_t* client) {
-    client->request.connection_close = 1;
-    return create_empty_body_response(client, "500 Internal Server Error");
+void create_500_internal_error_response(client_t* client, int* ok) {
+    return create_empty_body_response(client, "500 Internal Server Error", ok);
 }
 
-int create_501_not_implemented_response(client_t* client) {
-    client->request.connection_close = 1;
-    return create_empty_body_response(client, "501 Not Implemented");
+void create_501_not_implemented_response(client_t* client, int* ok) {
+    return create_empty_body_response(client, "501 Not Implemented", ok);
 }
 
-int create_fs_response(client_t* client, server_config_t* config) {
+void create_fs_response(client_t* client, server_config_t* config) {
     if (
         strcmp(client->request.method, "GET") != 0
         && strcmp(client->request.method, "HEAD") != 0
         ) {
-        return create_405_invalid_method_response(client);
+        return set_client_error(client, HTTP_405_NOT_ALLOWED);
     }
     if (!is_valid_path(client->request.path)) {
-        return create_400_bad_request_response(client);
+        return set_client_error(client, HTTP_400_BAD_REQUEST);
     }
 
     char resolved[PATH_MAX];
 
     if (!resolve_path(resolved, sizeof(resolved), config, client->request.path)) {
-        return create_404_not_found_response(client);
+        return set_client_error(client, HTTP_404_NOT_FOUND);
     }
 
     char* file_data = NULL;
     int file_len = 0;
 
     if (!read_file(resolved, &file_data, &file_len)) {
-        return create_403_forbidden_response(client);
+        return set_client_error(client, HTTP_403_FORBIDDEN);
     }
 
     const char* mime = get_mime_type(resolved);
@@ -873,7 +884,7 @@ int create_fs_response(client_t* client, server_config_t* config) {
         client->response.data = malloc(header_cap);
         if (!client->response.data) {
             free(file_data);
-            return 0;
+            return set_client_error(client, HTTP_500_INTERNAL_ERROR);
         }
         int header_len = snprintf(client->response.data, header_cap,
             "HTTP/1.1 200 OK\r\n"
@@ -887,11 +898,11 @@ int create_fs_response(client_t* client, server_config_t* config) {
         );
         if (header_len <= 0 || header_len >= header_cap) {
             free(file_data);
-            return 0;
+            return set_client_error(client, HTTP_500_INTERNAL_ERROR);
         }
         client->response.len = header_len;
         free(file_data);
-        return 1;
+        return;
     }
 
     // allocate header + file
@@ -901,7 +912,7 @@ int create_fs_response(client_t* client, server_config_t* config) {
     client->response.data = malloc(total_cap);
     if (!client->response.data) {
         free(file_data);
-        return 0;
+        return set_client_error(client, HTTP_500_INTERNAL_ERROR);
     }
 
     int header_len = snprintf(
@@ -919,7 +930,7 @@ int create_fs_response(client_t* client, server_config_t* config) {
     if (header_len <= 0 || header_len >= header_cap) {
         free(file_data);
         free(client->response.data);
-        return 0;
+        return set_client_error(client, HTTP_500_INTERNAL_ERROR);
     }
 
     // copy file after headers
@@ -928,7 +939,7 @@ int create_fs_response(client_t* client, server_config_t* config) {
     client->response.len = header_len + file_len;
 
     free(file_data);
-    return 1;
+    return;
 }
 
 // ----------------------------------------------
@@ -936,12 +947,29 @@ int create_fs_response(client_t* client, server_config_t* config) {
 // ----------------------------------------------
 
 void handle_request(client_t* client, server_config_t* config) {
-    int ok = 0;
     if (config->mode == MODE_ECHO) {
-        ok = create_echo_response(client);
+        create_echo_response(client);
     }
     else {
-        ok = create_fs_response(client, config);
+        create_fs_response(client, config);
+    }
+
+    int ok = 1;
+
+    if (client->error_code > 399) {
+        client->request.connection_close = 1;
+
+        switch (client->error_code) {
+        case HTTP_400_BAD_REQUEST: create_400_bad_request_response(client, &ok); break;
+        case HTTP_403_FORBIDDEN: create_403_forbidden_response(client, &ok); break;
+        case HTTP_404_NOT_FOUND: create_404_not_found_response(client, &ok); break;
+        case HTTP_405_NOT_ALLOWED: create_405_invalid_method_response(client, &ok); break;
+
+        case HTTP_500_INTERNAL_ERROR: create_500_internal_error_response(client, &ok); break;
+        case HTTP_501_NOT_IMPLEMENTED: create_501_not_implemented_response(client, &ok); break;
+
+        default: create_500_internal_error_response(client, &ok); break;
+        }
     }
 
     if (ok) client->state = STATE_WRITING;
