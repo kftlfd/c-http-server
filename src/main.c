@@ -159,11 +159,15 @@ long now_ms() {
 // Logs
 // ----------------------------------------------
 
-#ifndef LOG_LEVEL_DEFAULT
-#define LOG_LEVEL_DEFAULT LOG_DEBUG
-#endif
+static log_level_t LOG_LEVEL = LOG_INFO;
 
-static log_level_t LOG_LEVEL = LOG_LEVEL_DEFAULT;
+int parse_log_level(const char* s) {
+    if (strcmp(s, "debug") == 0) { LOG_LEVEL = LOG_DEBUG; return 1; }
+    if (strcmp(s, "info") == 0) { LOG_LEVEL = LOG_INFO; return 1; }
+    if (strcmp(s, "warn") == 0) { LOG_LEVEL = LOG_WARN; return 1; }
+    if (strcmp(s, "error") == 0) { LOG_LEVEL = LOG_ERROR; return 1; }
+    return 0;
+}
 
 void log_msg(log_level_t level, const char* fmt, ...) {
     if (level < LOG_LEVEL) return;
@@ -1312,7 +1316,7 @@ int main(int argc, char** argv) {
     server_config_t config = { 0 };
 
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s echo | fs <dir>\n", argv[0]);
+        fprintf(stderr, "Usage: %s echo | fs <dir> [--log=debug|info|warn|error]\n", argv[0]);
         exit(1);
     }
 
@@ -1339,6 +1343,15 @@ int main(int argc, char** argv) {
     else {
         fprintf(stderr, "Unknown command\n");
         exit(1);
+    }
+
+    for (int i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "--log=", 6) == 0) {
+            if (!parse_log_level(argv[i] + 6)) {
+                fprintf(stderr, "Invalid log level\n");
+                exit(1);
+            }
+        }
     }
 
     config.keep_alive_timeout_ms = 5000;
