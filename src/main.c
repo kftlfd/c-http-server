@@ -96,6 +96,15 @@ typedef struct Request {
     char* body;
 } request_t;
 
+typedef struct Response {
+    char* data;
+    int len;
+    int sent;
+
+    int status_code;
+    int connection_close; // 1 = close, 0 = keep-alive
+} response_t;
+
 typedef struct Client {
     client_state_t state;
     int fd;
@@ -111,9 +120,7 @@ typedef struct Client {
     int headers_done;
     int headers_len;
 
-    char* response;
-    int response_len;
-    int response_sent;
+    response_t response;
 } client_t;
 
 typedef struct pollfd pollfd_t;
@@ -302,9 +309,9 @@ void free_client(client_t* client) {
         client->buffer = NULL;
         client->request.body = NULL;
     }
-    if (client->response != NULL) {
-        free(client->response);
-        client->response = NULL;
+    if (client->response.data != NULL) {
+        free(client->response.data);
+        client->response.data = NULL;
     }
 }
 
@@ -432,13 +439,12 @@ void reset_client_for_next_request(client_t* client) {
     client->request.connection_close = 1;
 
     // Reset response
-    if (client->response) {
-        free(client->response);
-        client->response = NULL;
+    if (client->response.data) {
+        free(client->response.data);
+        client->response.data = NULL;
     }
 
-    client->response_len = 0;
-    client->response_sent = 0;
+    memset(&client->response, 0, sizeof(response_t));
 
     client->last_activity_ms = now_ms();
     client->state = STATE_READING;
@@ -587,11 +593,11 @@ int create_echo_response(client_t* client) {
     char* conn = client->request.connection_close ? "close" : "keep-alive";
 
     if (client->request.content_len == 0 || client->request.body == NULL) {
-        client->response = malloc(1024);
-        if (client->response == NULL) return 1;
+        client->response.data = malloc(1024);
+        if (client->response.data == NULL) return 1;
 
-        client->response_len = snprintf(
-            client->response,
+        client->response.len = snprintf(
+            client->response.data,
             1024,
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: text/plain\r\n"
@@ -602,7 +608,7 @@ int create_echo_response(client_t* client) {
             conn
         );
 
-        if (client->response_len < 0) {
+        if (client->response.len < 0) {
             fprintf(stderr, "write response: sprintf failed or truncated\n");
             return 0;
         }
@@ -613,15 +619,15 @@ int create_echo_response(client_t* client) {
         if (body_len > INT_MAX - 4096) return 0;
 
         int response_cap = 4096 + body_len;
-        client->response = malloc(sizeof(char) * response_cap);
+        client->response.data = malloc(sizeof(char) * response_cap);
 
-        if (client->response == NULL) {
+        if (client->response.data == NULL) {
             perror("allocate response");
             return 0;
         }
 
-        client->response_len = snprintf(
-            client->response,
+        client->response.len = snprintf(
+            client->response.data,
             response_cap,
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: text/plain\r\n"
@@ -634,7 +640,7 @@ int create_echo_response(client_t* client) {
             client->request.body
         );
 
-        if (client->response_len < 0 || client->response_len >= response_cap) {
+        if (client->response.len < 0 || client->response.len >= response_cap) {
             fprintf(stderr, "write response: sprintf failed or truncated\n");
             return 0;
         }
@@ -782,12 +788,14 @@ int read_file(const char* path, char** out_buf, int* out_len) {
 }
 
 int create_empty_body_response(client_t* client, const char* status_code_message) {
-    client->response = malloc(512);
-    if (!client->response) return 0;
+    response_t* res = &client->response;
+
+    res->data = malloc(512);
+    if (!res->data) return 0;
 
     char* conn = client->request.connection_close ? "close" : "keep-alive";
 
-    int n = snprintf(client->response, 512,
+    int n = snprintf(res->data, 512,
         "HTTP/1.1 %s\r\n"
         "Content-Length: 0\r\n"
         "Connection: %s\r\n"
@@ -797,7 +805,9 @@ int create_empty_body_response(client_t* client, const char* status_code_message
     );
     if (n < 1) { return 0; }
 
-    client->response_len = n;
+    res->len = n;
+    res->sent = 0;
+    res->connection_close = client->request.connection_close;
     return 1;
 }
 
@@ -860,12 +870,12 @@ int create_fs_response(client_t* client, server_config_t* config) {
 
     if (strcmp(client->request.method, "HEAD") != 0) {
         int header_cap = 512;
-        client->response = malloc(header_cap);
-        if (!client->response) {
+        client->response.data = malloc(header_cap);
+        if (!client->response.data) {
             free(file_data);
             return 0;
         }
-        int header_len = snprintf(client->response, header_cap,
+        int header_len = snprintf(client->response.data, header_cap,
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: %s\r\n"
             "Content-Length: %d\r\n"
@@ -879,7 +889,7 @@ int create_fs_response(client_t* client, server_config_t* config) {
             free(file_data);
             return 0;
         }
-        client->response_len = header_len;
+        client->response.len = header_len;
         free(file_data);
         return 1;
     }
@@ -888,14 +898,14 @@ int create_fs_response(client_t* client, server_config_t* config) {
     int header_cap = 1024;
     int total_cap = header_cap + file_len;
 
-    client->response = malloc(total_cap);
-    if (!client->response) {
+    client->response.data = malloc(total_cap);
+    if (!client->response.data) {
         free(file_data);
         return 0;
     }
 
     int header_len = snprintf(
-        client->response,
+        client->response.data,
         header_cap,
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: %s\r\n"
@@ -908,14 +918,14 @@ int create_fs_response(client_t* client, server_config_t* config) {
     );
     if (header_len <= 0 || header_len >= header_cap) {
         free(file_data);
-        free(client->response);
+        free(client->response.data);
         return 0;
     }
 
     // copy file after headers
-    memcpy(client->response + header_len, file_data, file_len);
+    memcpy(client->response.data + header_len, file_data, file_len);
 
-    client->response_len = header_len + file_len;
+    client->response.len = header_len + file_len;
 
     free(file_data);
     return 1;
@@ -947,12 +957,14 @@ void handle_request(client_t* client, server_config_t* config) {
  * handles partial writes and interrupts
  */
 void handle_write(client_t* client) {
-    while (client->response_sent < client->response_len) {
+    response_t* res = &client->response;
+
+    while (res->sent < res->len) {
         // write next bytes
         ssize_t n = write(
             client->fd,
-            client->response + client->response_sent,
-            client->response_len - client->response_sent
+            res->data + res->sent,
+            res->len - res->sent
         );
 
         if (n <= 0) {
@@ -964,11 +976,11 @@ void handle_write(client_t* client) {
             }
         }
 
-        client->response_sent += n;
+        res->sent += n;
         client->last_activity_ms = now_ms();
     }
 
-    if (client->request.connection_close || client->peer_closed) {
+    if (res->connection_close || client->peer_closed) {
         client->state = STATE_DONE;
     }
     else {
@@ -1150,9 +1162,8 @@ void init_server_event_loop(server_config_t* config) {
 
                 clients[nfds].headers_done = 0;
                 clients[nfds].headers_len = 0;
-                clients[nfds].response = NULL;
-                clients[nfds].response_len = 0;
-                clients[nfds].response_sent = 0;
+
+                memset(&clients[nfds].response, 0, sizeof(response_t));
 
                 nfds++;
 
