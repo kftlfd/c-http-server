@@ -684,10 +684,10 @@ int resolve_path(char* out, size_t cap, server_config_t* config, const char* url
 
     // Case 1: "/"
     if (url_path[0] == '/' && url_path[1] == '\0') {
-        snprintf(path, sizeof(path), "%s/index.html", config->fs_root);
+        if (snprintf(path, sizeof(path), "%s/index.html", config->fs_root) >= sizeof(path)) return 0;
 
         if (file_exists(path, &is_dir) && !is_dir) {
-            snprintf(out, cap, "%s", path);
+            if (snprintf(out, cap, "%s", path) >= cap) return 0;
             return 1;
         }
 
@@ -696,16 +696,16 @@ int resolve_path(char* out, size_t cap, server_config_t* config, const char* url
 
     // build base path, strip leading '/'
     const char* rel = url_path + 1;
-    snprintf(path, sizeof(path), "%s/%s", config->fs_root, rel);
+    if (snprintf(path, sizeof(path), "%s/%s", config->fs_root, rel) >= sizeof(path)) return 0;
 
     // Case 2: ends with "/"
     size_t len = strlen(url_path);
     if (url_path[len - 1] == '/') {
         char with_index[PATH_MAX];
-        snprintf(with_index, sizeof(with_index), "%s/index.html", path);
+        if (snprintf(with_index, sizeof(with_index), "%s/index.html", path) >= sizeof(with_index)) return 0;
 
         if (file_exists(with_index, &is_dir) && !is_dir) {
-            snprintf(out, cap, "%s", with_index);
+            if (snprintf(out, cap, "%s", with_index) >= cap) return 0;
             return 1;
         }
 
@@ -714,24 +714,24 @@ int resolve_path(char* out, size_t cap, server_config_t* config, const char* url
 
     // Case 3: try exact file
     if (file_exists(path, &is_dir) && !is_dir) {
-        snprintf(out, cap, "%s", path);
+        if (snprintf(out, cap, "%s", path) >= cap) return 0;
         return 1;
     }
 
     // Case 4: try ".html"
     char with_html[PATH_MAX];
-    snprintf(with_html, sizeof(with_html), "%s.html", path);
+    if (snprintf(with_html, sizeof(with_html), "%s.html", path) >= sizeof(with_html)) return 0;
     if (file_exists(with_html, &is_dir) && !is_dir) {
-        snprintf(out, cap, "%s", with_html);
+        if (snprintf(out, cap, "%s", with_html) >= cap) return 0;
         return 1;
     }
 
     // Case 5: try directory index
     char with_index[PATH_MAX];
-    snprintf(with_index, sizeof(with_index), "%s/index.html", path);
+    if (snprintf(with_index, sizeof(with_index), "%s/index.html", path) >= sizeof(with_index)) return 0;
     printf("%s\n", with_index);
     if (file_exists(with_index, &is_dir) && !is_dir) {
-        snprintf(out, cap, "%s", with_index);
+        if (snprintf(out, cap, "%s", with_index) >= cap) return 0;
         return 1;
     }
 
@@ -744,13 +744,13 @@ const char* get_mime_type(const char* path) {
 
     ext++; // skip '.'
 
-    if (strcasecmp(ext, "html") == 0) return "text/html";
+    if (strcasecmp(ext, "html") == 0) return "text/html; charset=utf-8";
     if (strcasecmp(ext, "css") == 0) return "text/css";
     if (strcasecmp(ext, "js") == 0) return "application/javascript";
     if (strcasecmp(ext, "png") == 0) return "image/png";
     if (strcasecmp(ext, "jpg") == 0 || strcasecmp(ext, "jpeg") == 0) return "image/jpeg";
     if (strcasecmp(ext, "gif") == 0) return "image/gif";
-    if (strcasecmp(ext, "txt") == 0) return "text/plain";
+    if (strcasecmp(ext, "txt") == 0) return "text/plain; charset=utf-8";
 
     return "application/octet-stream";
 };
@@ -763,7 +763,7 @@ int read_file(const char* path, char** out_buf, int* out_len) {
 
     if (st.st_size < 0 || st.st_size > MAX_FILE_SIZE) return 0;
 
-    int size = (int)st.st_size;
+    size_t size = st.st_size;
 
     FILE* f = fopen(path, "rb");
     if (!f) return 0;
@@ -771,7 +771,7 @@ int read_file(const char* path, char** out_buf, int* out_len) {
     char* buf = malloc(size);
     if (!buf) { fclose(f); return 0; }
 
-    int read_bytes = fread(buf, 1, size, f);
+    size_t read_bytes = fread(buf, 1, size, f);
     fclose(f);
 
     if (read_bytes != size) { free(buf); return 0; }
@@ -802,26 +802,32 @@ int create_empty_body_response(client_t* client, const char* status_code_message
 }
 
 int create_400_bad_request_response(client_t* client) {
+    client->request.connection_close = 1;
     return create_empty_body_response(client, "400 Bad Request");
 }
 
 int create_403_forbidden_response(client_t* client) {
+    client->request.connection_close = 1;
     return create_empty_body_response(client, "403 Forbidden");
 }
 
 int create_404_not_found_response(client_t* client) {
+    client->request.connection_close = 1;
     return create_empty_body_response(client, "404 Not Found");
 }
 
 int create_405_invalid_method_response(client_t* client) {
+    client->request.connection_close = 1;
     return create_empty_body_response(client, "405 Method Not Allowed");
 }
 
 int create_500_internal_error_response(client_t* client) {
+    client->request.connection_close = 1;
     return create_empty_body_response(client, "500 Internal Server Error");
 }
 
 int create_501_not_implemented_response(client_t* client) {
+    client->request.connection_close = 1;
     return create_empty_body_response(client, "501 Not Implemented");
 }
 
