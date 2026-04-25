@@ -1,22 +1,43 @@
 /**
  * HTTP echo / static files server
- * - non-blocking I/O, client state machine
- * - HTTP/1.1 keep-alive, buffer reuse
- * - request parsing
- * - routing, static file serving
- * - request lifecycle, timeouts
- * - basic pipelining
+ * - non-blocking I/O (poll-based event loop)
+ * - per-client state machine (read -> handle -> write)
+ * - HTTP/1.1 keep-alive support
+ * - basic request parsing (request line + headers)
+ * - static file serving (GET + HEAD)
+ * - simple routing (/, .html fallback, index.html)
+ * - connection timeouts
+ * - basic pipelining support
  *
- * Known limitations:
- * - no "transfer-encoding"
- * - no streaming
- * - no caching
- * - ...
+  * Limitations:
+ * - only HTTP/1.1 (no HTTP/2, no TLS)
+ * - only GET+HEAD supported in fs mode (no POST, etc.)
+ * - no "Transfer-Encoding: chunked"
+ * - no request streaming (entire request buffered)
+ * - no response streaming (entire file buffered in memory)
+ * - no persistent caching (files read on each request)
+ * - limited MIME type detection
+ * - no range requests (partial content)
+ * - no directory listing
+ * - no URL decoding (%20 etc.)
+ * - strict path validation (may reject some valid URLs)
+ * - no concurrency beyond poll() (single-threaded)
+ * - fixed limits:
+ *     - max clients
+ *     - max request size
+ *     - max file size
+ *
+ * Security notes:
+ * - prevents directory traversal ("..")
+ * - restricts allowed path characters
+ * - does not follow symlinks explicitly (depends on stat)
+ * - not hardened for production use
  *
  * TODO:
- * - LRU cache for files
- * - sendfile(), streaming optimization
- * - ...
+ * - sendfile() / streaming responses for large files
+ * - LRU file cache
+ * - more complete MIME type handling
+ * - configuration (port, limits, timeouts)
  */
 
 #include <stdio.h>      // printf(), perror()
@@ -61,6 +82,16 @@ typedef enum ClientState {
     STATE_ERROR
 } client_state_t;
 
+typedef enum HttpStatus {
+    HTTP_200_OK = 200,
+    HTTP_400_BAD_REQUEST = 400,
+    HTTP_403_FORBIDDEN = 403,
+    HTTP_404_NOT_FOUND = 404,
+    HTTP_405_NOT_ALLOWED = 405,
+    HTTP_500_INTERNAL_ERROR = 500,
+    HTTP_501_NOT_IMPLEMENTED = 501
+} http_status_t;
+
 typedef struct Request {
     int headers_len;
     int body_len;
@@ -75,12 +106,22 @@ typedef struct Request {
     char* body;
 } request_t;
 
+typedef struct Response {
+    char* data;
+    int len;
+    int sent;
+
+    int status_code;
+    int connection_close; // 1 = close, 0 = keep-alive
+} response_t;
+
 typedef struct Client {
     client_state_t state;
     int fd;
     struct sockaddr_in addr;
     long last_activity_ms;
     int peer_closed;
+    http_status_t error_code;
 
     char* buffer;
     int buffer_len;
@@ -90,9 +131,7 @@ typedef struct Client {
     int headers_done;
     int headers_len;
 
-    char* response;
-    int response_len;
-    int response_sent;
+    response_t response;
 } client_t;
 
 typedef struct pollfd pollfd_t;
@@ -281,9 +320,9 @@ void free_client(client_t* client) {
         client->buffer = NULL;
         client->request.body = NULL;
     }
-    if (client->response != NULL) {
-        free(client->response);
-        client->response = NULL;
+    if (client->response.data != NULL) {
+        free(client->response.data);
+        client->response.data = NULL;
     }
 }
 
@@ -298,6 +337,11 @@ void close_client(pollfd_t* pfds, client_t* clients, int* nfds, int i) {
     clients[i] = clients[(*nfds) - 1];
 
     (*nfds)--;
+}
+
+void set_client_error(client_t* client, http_status_t status_code) {
+    client->error_code = status_code;
+    client->state = STATE_HANDLING;
 }
 
 // ----------------------------------------------
@@ -375,7 +419,7 @@ int parse_request_headers(client_t* client) {
                 }
             }
             else if (strcasecmp(key, "transfer-encoding") == 0) {
-                return 0; // not supported
+                return -1; // not supported
             }
         }
 
@@ -411,16 +455,16 @@ void reset_client_for_next_request(client_t* client) {
     client->request.connection_close = 1;
 
     // Reset response
-    if (client->response) {
-        free(client->response);
-        client->response = NULL;
+    if (client->response.data) {
+        free(client->response.data);
+        client->response.data = NULL;
     }
 
-    client->response_len = 0;
-    client->response_sent = 0;
+    memset(&client->response, 0, sizeof(response_t));
 
     client->last_activity_ms = now_ms();
     client->state = STATE_READING;
+    client->error_code = 0;
 }
 
 /**
@@ -433,12 +477,12 @@ void handle_read(client_t* client) {
          * grow buffer if needed
          */
         if (client->buffer_len + 1 >= client->buffer_cap) {
-            if (client->buffer_cap > MAX_REQUEST_SIZE / 2) goto err_next;
+            if (client->buffer_cap > MAX_REQUEST_SIZE / 2) return set_client_error(client, HTTP_400_BAD_REQUEST);
             client->buffer_cap *= 2;
             int body_offset = -1;
             if (client->request.body != NULL) body_offset = client->request.body - client->buffer;
             char* tmp = realloc(client->buffer, client->buffer_cap);
-            if (tmp == NULL) goto err_next;
+            if (tmp == NULL) return set_client_error(client, HTTP_500_INTERNAL_ERROR);
             client->buffer = tmp;
             if (body_offset >= 0) client->request.body = client->buffer + body_offset;
         }
@@ -456,6 +500,7 @@ void handle_read(client_t* client) {
 
             if (want_end > write_pos) {
                 size_t remaining = want_end - write_pos;
+                if (remaining < 0) remaining = 0;
                 if (remaining < read_bytes) read_bytes = remaining;
             }
             else {
@@ -468,7 +513,7 @@ void handle_read(client_t* client) {
 
         if (read_bytes == 0) {
             if (client->headers_done) goto next_step;
-            else goto err_next;
+            else return set_client_error(client, HTTP_400_BAD_REQUEST);
         }
 
         ssize_t n = read(client->fd, write_pos, read_bytes);
@@ -477,10 +522,10 @@ void handle_read(client_t* client) {
             if (errno == EINTR) continue;
             else if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 // If peer already closed, no more data will come
-                if (client->peer_closed) goto err_next;
+                if (client->peer_closed) return set_client_error(client, HTTP_400_BAD_REQUEST);
                 break;
             }
-            else goto err_next;
+            else set_client_error(client, HTTP_400_BAD_REQUEST);
         }
 
         /**
@@ -496,7 +541,7 @@ void handle_read(client_t* client) {
             }
 
             // Case 2: partial request -> error
-            if (!client->headers_done) goto err_next;
+            if (!client->headers_done) return set_client_error(client, HTTP_400_BAD_REQUEST);
 
             // Case 3: headers done, check body
             // If no body expected OR already fully read -> OK
@@ -506,7 +551,7 @@ void handle_read(client_t* client) {
             }
             if (body_received >= client->request.content_len) goto next_step;
 
-            goto err_next;
+            return set_client_error(client, HTTP_400_BAD_REQUEST);
         };
 
         client->buffer_len += n;
@@ -515,7 +560,7 @@ void handle_read(client_t* client) {
 
         if (!client->headers_done && client->buffer_len > MAX_HEADERS_SIZE) {
             fprintf(stderr, "Headers too large\n");
-            goto err_next;
+            return set_client_error(client, HTTP_400_BAD_REQUEST);
         }
 
         // check for headers end
@@ -530,7 +575,9 @@ void handle_read(client_t* client) {
                 client->request.headers_len = headers_len;
                 client->request.body = headers_end + 4;
 
-                if (!parse_request_headers(client)) goto err_next;
+                int ok = parse_request_headers(client);
+                if (ok < 0) return set_client_error(client, HTTP_405_NOT_ALLOWED);
+                if (ok < 1) return set_client_error(client, HTTP_400_BAD_REQUEST);
             }
         }
 
@@ -541,8 +588,6 @@ void handle_read(client_t* client) {
         }
     }
     return;
-
-err_next: { client->state = STATE_ERROR; return; }
 
 next_step: {
     printf(
@@ -555,70 +600,110 @@ next_step: {
 
     client->state = STATE_HANDLING;
     return;
+    }
 }
+
+// ----------------------------------------------
+// Build response
+// ----------------------------------------------
+
+int response_build(
+    response_t* res,
+    http_status_t status_code,
+    const char* status_text,
+    const char* content_type,
+    const char* body,
+    int body_len,
+    int connection_close
+) {
+    printf("> build: status=%d, body_len=%d\n", status_code, body_len);
+
+    int header_cap = 1024;
+
+    int total_cap = header_cap + body_len;
+
+    res->data = malloc(total_cap);
+    if (!res->data) return 0;
+
+    printf("> build: data allocated");
+
+    const char* conn = connection_close ? "close" : "keep-alive";
+
+    int header_len = snprintf(
+        res->data,
+        header_cap,
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: %s\r\n"
+        "\r\n",
+        status_code,
+        status_text,
+        content_type ? content_type : "application/octet-stream",
+        body_len,
+        conn
+    );
+
+    printf("> build: header_len=%d\n", header_len);
+
+    if (header_len < 0 || header_len >= header_cap) {
+        free(res->data);
+        return 0;
+    }
+
+    if (body_len > 0 && body != NULL) {
+        memcpy(res->data + header_len, body, body_len);
+    }
+
+    res->len = header_len + body_len;
+    res->sent = 0;
+    res->connection_close = connection_close;
+
+    return 1;
+}
+
+int create_error_response(client_t* client, http_status_t code) {
+    const char* text = "Internal Server Error";
+
+    switch (code) {
+    case HTTP_400_BAD_REQUEST: text = "Bad Request"; break;
+    case HTTP_403_FORBIDDEN: text = "Forbidden"; break;
+    case HTTP_404_NOT_FOUND: text = "Not Found"; break;
+    case HTTP_405_NOT_ALLOWED: text = "Method Not Allowed"; break;
+    case HTTP_501_NOT_IMPLEMENTED: text = "Not Implemented"; break;
+    default: break;
+    }
+
+    return response_build(
+        &client->response,
+        code,
+        text,
+        "text/plain",
+        NULL,
+        0,
+        1 // always close on error
+    );
 }
 
 // ----------------------------------------------
 // Echo response
 // ----------------------------------------------
 
-int create_echo_response(client_t* client) {
-    char* conn = client->request.connection_close ? "close" : "keep-alive";
+void create_echo_response(client_t* client) {
+    int body_len = client->request.content_len;
+    const char* body = client->request.body;
 
-    if (client->request.content_len == 0 || client->request.body == NULL) {
-        client->response = malloc(1024);
-        if (client->response == NULL) return 1;
+    if (!body) body_len = 0;
 
-        client->response_len = snprintf(
-            client->response,
-            1024,
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/plain\r\n"
-            "Content-Length: %d\r\n"
-            "Connection: %s\r\n"
-            "\r\n",
-            0,
-            conn
-        );
-
-        if (client->response_len < 0) {
-            fprintf(stderr, "write response: sprintf failed or truncated\n");
-            return 0;
-        }
-    }
-    else {
-        int body_len = client->request.content_len;
-
-        if (body_len > INT_MAX - 4096) return 0;
-
-        int response_cap = 4096 + body_len;
-        client->response = malloc(sizeof(char) * response_cap);
-
-        if (client->response == NULL) {
-            perror("allocate response");
-            return 0;
-        }
-
-        client->response_len = snprintf(
-            client->response,
-            response_cap,
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/plain\r\n"
-            "Content-Length: %d\r\n"
-            "Connection: %s\r\n"
-            "\r\n"
-            "%s",
-            body_len,
-            conn,
-            client->request.body
-        );
-
-        if (client->response_len < 0 || client->response_len >= response_cap) {
-            fprintf(stderr, "write response: sprintf failed or truncated\n");
-            return 0;
-        }
-    }
-    return 1;
+    if (!response_build(
+        &client->response,
+        HTTP_200_OK,
+        "OK",
+        "text/plain",
+        body,
+        body_len,
+        client->request.connection_close
+    )) set_client_error(client, HTTP_500_INTERNAL_ERROR);
 }
 
 // ----------------------------------------------
@@ -660,13 +745,16 @@ int file_exists(const char* path, int* is_dir) {
 int resolve_path(char* out, size_t cap, server_config_t* config, const char* url_path) {
     char path[PATH_MAX];
     int is_dir = 0;
+    int n = 0;
 
     // Case 1: "/"
     if (url_path[0] == '/' && url_path[1] == '\0') {
-        snprintf(path, sizeof(path), "%s/index.html", config->fs_root);
+        n = snprintf(path, sizeof(path), "%s/index.html", config->fs_root);
+        if (n < 0 || (size_t)n >= sizeof(path)) return 0;
 
         if (file_exists(path, &is_dir) && !is_dir) {
-            snprintf(out, cap, "%s", path);
+            int n = snprintf(out, cap, "%s", path);
+            if (n < 0 || (size_t)n >= cap) return 0;
             return 1;
         }
 
@@ -675,16 +763,19 @@ int resolve_path(char* out, size_t cap, server_config_t* config, const char* url
 
     // build base path, strip leading '/'
     const char* rel = url_path + 1;
-    snprintf(path, sizeof(path), "%s/%s", config->fs_root, rel);
+    n = snprintf(path, sizeof(path), "%s/%s", config->fs_root, rel);
+    if (n < 0 || (size_t)n >= sizeof(path)) return 0;
 
     // Case 2: ends with "/"
     size_t len = strlen(url_path);
     if (url_path[len - 1] == '/') {
         char with_index[PATH_MAX];
-        snprintf(with_index, sizeof(with_index), "%s/index.html", path);
+        n = snprintf(with_index, sizeof(with_index), "%s/index.html", path);
+        if (n < 0 || (size_t)n >= sizeof(with_index)) return 0;
 
         if (file_exists(with_index, &is_dir) && !is_dir) {
-            snprintf(out, cap, "%s", with_index);
+            n = snprintf(out, cap, "%s", with_index);
+            if (n < 0 || (size_t)n >= cap) return 0;
             return 1;
         }
 
@@ -693,24 +784,29 @@ int resolve_path(char* out, size_t cap, server_config_t* config, const char* url
 
     // Case 3: try exact file
     if (file_exists(path, &is_dir) && !is_dir) {
-        snprintf(out, cap, "%s", path);
+        n = snprintf(out, cap, "%s", path);
+        if (n < 0 || (size_t)n >= cap) return 0;
         return 1;
     }
 
     // Case 4: try ".html"
     char with_html[PATH_MAX];
-    snprintf(with_html, sizeof(with_html), "%s.html", path);
+    n = snprintf(with_html, sizeof(with_html), "%s.html", path);
+    if (n < 0 || (size_t)n >= sizeof(with_html)) return 0;
     if (file_exists(with_html, &is_dir) && !is_dir) {
-        snprintf(out, cap, "%s", with_html);
+        n = snprintf(out, cap, "%s", with_html);
+        if (n < 0 || (size_t)n >= cap) return 0;
         return 1;
     }
 
     // Case 5: try directory index
     char with_index[PATH_MAX];
-    snprintf(with_index, sizeof(with_index), "%s/index.html", path);
+    n = snprintf(with_index, sizeof(with_index), "%s/index.html", path);
+    if (n < 0 || (size_t)n >= sizeof(with_index)) return 0;
     printf("%s\n", with_index);
     if (file_exists(with_index, &is_dir) && !is_dir) {
-        snprintf(out, cap, "%s", with_index);
+        n = snprintf(out, cap, "%s", with_index);
+        if (n < 0 || (size_t)n >= cap) return 0;
         return 1;
     }
 
@@ -723,13 +819,13 @@ const char* get_mime_type(const char* path) {
 
     ext++; // skip '.'
 
-    if (strcasecmp(ext, "html") == 0) return "text/html";
+    if (strcasecmp(ext, "html") == 0) return "text/html; charset=utf-8";
     if (strcasecmp(ext, "css") == 0) return "text/css";
     if (strcasecmp(ext, "js") == 0) return "application/javascript";
     if (strcasecmp(ext, "png") == 0) return "image/png";
     if (strcasecmp(ext, "jpg") == 0 || strcasecmp(ext, "jpeg") == 0) return "image/jpeg";
     if (strcasecmp(ext, "gif") == 0) return "image/gif";
-    if (strcasecmp(ext, "txt") == 0) return "text/plain";
+    if (strcasecmp(ext, "txt") == 0) return "text/plain; charset=utf-8";
 
     return "application/octet-stream";
 };
@@ -742,7 +838,7 @@ int read_file(const char* path, char** out_buf, int* out_len) {
 
     if (st.st_size < 0 || st.st_size > MAX_FILE_SIZE) return 0;
 
-    int size = (int)st.st_size;
+    size_t size = st.st_size;
 
     FILE* f = fopen(path, "rb");
     if (!f) return 0;
@@ -750,7 +846,7 @@ int read_file(const char* path, char** out_buf, int* out_len) {
     char* buf = malloc(size);
     if (!buf) { fclose(f); return 0; }
 
-    int read_bytes = fread(buf, 1, size, f);
+    size_t read_bytes = fread(buf, 1, size, f);
     fclose(f);
 
     if (read_bytes != size) { free(buf); return 0; }
@@ -760,109 +856,45 @@ int read_file(const char* path, char** out_buf, int* out_len) {
     return 1;
 }
 
-int create_empty_body_response(client_t* client, const char* status_code_message) {
-    client->response = malloc(512);
-    if (!client->response) return 0;
-
-    char* conn = client->request.connection_close ? "close" : "keep-alive";
-
-    int n = snprintf(client->response, 512,
-        "HTTP/1.1 %s\r\n"
-        "Content-Length: 0\r\n"
-        "Connection: %s\r\n"
-        "\r\n",
-        status_code_message,
-        conn
-    );
-    if (n < 1) { return 0; }
-
-    client->response_len = n;
-    return 1;
-}
-
-int create_400_bad_request_response(client_t* client) {
-    return create_empty_body_response(client, "400 Bad Request");
-}
-
-int create_403_forbidden_response(client_t* client) {
-    return create_empty_body_response(client, "403 Forbidden");
-}
-
-int create_404_not_found_response(client_t* client) {
-    return create_empty_body_response(client, "404 Not Found");
-}
-
-int create_405_invalid_method_response(client_t* client) {
-    return create_empty_body_response(client, "405 Method Not Allowed");
-}
-
-int create_500_internal_error_response(client_t* client) {
-    return create_empty_body_response(client, "500 Internal Server Error");
-}
-
-int create_501_not_implemented_response(client_t* client) {
-    return create_empty_body_response(client, "501 Not Implemented");
-}
-
-int create_fs_response(client_t* client, server_config_t* config) {
-    if (strcmp(client->request.method, "GET") != 0) {
-        return create_405_invalid_method_response(client);
+void create_fs_response(client_t* client, server_config_t* config) {
+    if (
+        strcmp(client->request.method, "GET") != 0
+        && strcmp(client->request.method, "HEAD") != 0
+        ) {
+        return set_client_error(client, HTTP_405_NOT_ALLOWED);
     }
     if (!is_valid_path(client->request.path)) {
-        return create_400_bad_request_response(client);
+        return set_client_error(client, HTTP_400_BAD_REQUEST);
     }
 
     char resolved[PATH_MAX];
 
     if (!resolve_path(resolved, sizeof(resolved), config, client->request.path)) {
-        return create_404_not_found_response(client);
+        return set_client_error(client, HTTP_404_NOT_FOUND);
     }
 
     char* file_data = NULL;
     int file_len = 0;
 
     if (!read_file(resolved, &file_data, &file_len)) {
-        return create_403_forbidden_response(client);
+        return set_client_error(client, HTTP_403_FORBIDDEN);
     }
 
     const char* mime = get_mime_type(resolved);
-    const char* conn = client->request.connection_close ? "close" : "keep-alive";
+    int is_head_req = strcmp(client->request.method, "HEAD") == 0;
 
-    // allocate header + file
-    int header_cap = 1024;
-    int total_cap = header_cap + file_len;
-
-    client->response = malloc(total_cap);
-    if (!client->response) {
-        free(file_data);
-        return 0;
-    }
-
-    int header_len = snprintf(
-        client->response,
-        header_cap,
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: %s\r\n"
-        "Content-Length: %d\r\n"
-        "Connection: %s\r\n"
-        "\r\n",
+    if (!response_build(
+        &client->response,
+        HTTP_200_OK,
+        "OK",
         mime,
+        is_head_req ? NULL : file_data,
         file_len,
-        conn
-    );
-    if (header_len <= 0 || header_len >= header_cap) {
-        free(file_data);
-        free(client->response);
-        return 0;
-    }
-
-    // copy file after headers
-    memcpy(client->response + header_len, file_data, file_len);
-
-    client->response_len = header_len + file_len;
+        client->request.connection_close
+    )) set_client_error(client, HTTP_500_INTERNAL_ERROR);
 
     free(file_data);
-    return 1;
+    return;
 }
 
 // ----------------------------------------------
@@ -870,16 +902,30 @@ int create_fs_response(client_t* client, server_config_t* config) {
 // ----------------------------------------------
 
 void handle_request(client_t* client, server_config_t* config) {
-    int ok = 0;
-    if (config->mode == MODE_ECHO) {
-        ok = create_echo_response(client);
-    }
-    else {
-        ok = create_fs_response(client, config);
+    if (client->error_code == 0) {
+        if (config->mode == MODE_ECHO) {
+            create_echo_response(client);
+        }
+        else {
+            create_fs_response(client, config);
+        }
     }
 
-    if (ok) client->state = STATE_WRITING;
-    else client->state = STATE_ERROR;
+    if (client->error_code != 0 && (
+        client->error_code < 100 || client->error_code > 599
+        )) {
+        fprintf(stderr, "Invalid HTTP status: %d\n", client->error_code);
+        set_client_error(client, HTTP_500_INTERNAL_ERROR);
+    }
+
+    if (client->error_code != 0) {
+        if (!create_error_response(client, client->error_code)) {
+            client->state = STATE_ERROR;
+            return;
+        }
+    }
+
+    client->state = STATE_WRITING;
 }
 
 // ----------------------------------------------
@@ -891,13 +937,23 @@ void handle_request(client_t* client, server_config_t* config) {
  * handles partial writes and interrupts
  */
 void handle_write(client_t* client) {
-    while (client->response_sent < client->response_len) {
+    response_t* res = &client->response;
+
+    printf(">> write: response len = %d, sent = %d\n", res->len, res->sent);
+
+    printf(">> write: response:\n%.*s\n", res->len - res->sent, res->data + res->sent);
+
+    while (res->sent < res->len) {
+        printf(">> write: len = %d, sent = %d\n", res->len, res->sent);
+
         // write next bytes
         ssize_t n = write(
             client->fd,
-            client->response + client->response_sent,
-            client->response_len - client->response_sent
+            res->data + res->sent,
+            res->len - res->sent
         );
+
+        printf(">> write: write() => %zd\n", n);
 
         if (n <= 0) {
             if (errno == EINTR) continue;
@@ -908,11 +964,11 @@ void handle_write(client_t* client) {
             }
         }
 
-        client->response_sent += n;
+        res->sent += n;
         client->last_activity_ms = now_ms();
     }
 
-    if (client->request.connection_close || client->peer_closed) {
+    if (res->connection_close || client->peer_closed) {
         client->state = STATE_DONE;
     }
     else {
@@ -1079,11 +1135,14 @@ void init_server_event_loop(server_config_t* config) {
 
                 pfds[nfds].fd = client_fd;
 
+                memset(&clients[nfds], 0, sizeof(client_t));
+
                 clients[nfds].state = STATE_READING;
                 clients[nfds].fd = client_fd;
                 clients[nfds].addr = client_addr;
                 clients[nfds].last_activity_ms = now_ms();
                 clients[nfds].peer_closed = 0;
+                clients[nfds].error_code = 0;
 
                 clients[nfds].buffer = buffer;
                 clients[nfds].buffer_len = 0;
@@ -1094,9 +1153,8 @@ void init_server_event_loop(server_config_t* config) {
 
                 clients[nfds].headers_done = 0;
                 clients[nfds].headers_len = 0;
-                clients[nfds].response = NULL;
-                clients[nfds].response_len = 0;
-                clients[nfds].response_sent = 0;
+
+                memset(&clients[nfds].response, 0, sizeof(response_t));
 
                 nfds++;
 
