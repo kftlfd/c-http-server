@@ -103,12 +103,21 @@ typedef enum HttpStatus {
     HTTP_501_NOT_IMPLEMENTED = 501
 } http_status_t;
 
+typedef struct Buffer {
+    char* data;
+    int len;
+    int cap;
+} buffer_t;
+
 typedef struct Request {
-    int headers_len;
-    int body_offset;
-    int body_len;
-    int content_len;
+    int id;
+    buffer_t buffer;
+
+    int headers_done;
     int connection_close; // 1 = close, 0 = keep-alive
+
+    int headers_len;
+    int body_len;
 
     char method[8];
     char path[1024];
@@ -116,8 +125,7 @@ typedef struct Request {
 } request_t;
 
 typedef struct Response {
-    char* data;
-    int len;
+    buffer_t buffer;
     int sent;
 
     int status_code;
@@ -133,15 +141,7 @@ typedef struct Client {
     int peer_closed;
     http_status_t error_code;
 
-    char* buffer;
-    int buffer_len;
-    int buffer_cap;
-
-    int request_id;
     request_t request;
-    int headers_done;
-    int headers_len;
-
     response_t response;
 } client_t;
 
@@ -248,7 +248,7 @@ void log_msg(log_level_t level, const char* fmt, ...) {
 
 #define LOG_CLIENT(level, client, fmt, ...) \
     log_msg(level, "[c=%d fd=%d req=%d state=%s]\t" fmt, \
-        (client)->id, (client)->fd, (client)->request_id, \
+        (client)->id, (client)->fd, (client)->request.id, \
         state_str((client)->state), ##__VA_ARGS__)
 
 #define LOG_CLIENT_DUMP(client, fmt, ...) LOG_CLIENT(LOG_L_DUMP, client, fmt, ##__VA_ARGS__)
@@ -259,8 +259,45 @@ void log_msg(log_level_t level, const char* fmt, ...) {
 
 #define LOG_CLIENT_PERROR(client, fmt, ...) \
     LOG_PERROR("[c=%d fd=%d req=%d state=%s]\t" fmt, \
-        (client)->id, (client)->fd, (client)->request_id, \
+        (client)->id, (client)->fd, (client)->request.id, \
         state_str((client)->state), ##__VA_ARGS__)
+
+// ----------------------------------------------
+// Buffer helpers
+// ----------------------------------------------
+
+int buffer_init(buffer_t* buf, int size) {
+    memset(buf, 0, sizeof(buffer_t));
+    buf->data = malloc(size);
+    if (!buf->data) return -1;
+    buf->len = 0;
+    buf->cap = size;
+    return 1;
+}
+
+void buffer_free(buffer_t* buf) {
+    if (buf->data) free(buf->data);
+    memset(buf, 0, sizeof(buffer_t));
+}
+
+int buffer_reserve(buffer_t* buf, int needed) {
+    int new_cap = buf->cap;
+
+    while (new_cap < needed) {
+        if (new_cap >= INT_MAX / 2) return -1;
+        new_cap *= 2;
+    }
+
+    if (new_cap <= buf->cap) return 1;
+
+    char* tmp = realloc(buf->data, new_cap);
+
+    if (tmp == NULL) return -1;
+
+    buf->data = tmp;
+    buf->cap = new_cap;
+    return 1;
+}
 
 // ----------------------------------------------
 // Signal handlers
@@ -444,14 +481,13 @@ int setup_server() {
  * Free allocated memory for client
  */
 void free_client(client_t* client) {
-    if (client->buffer != NULL) {
-        free(client->buffer);
-        client->buffer = NULL;
-        client->request.body_offset = 0;
+    if (client->request.buffer.data != NULL) {
+        buffer_free(&client->request.buffer);
+        memset(&client->request, 0, sizeof(request_t));
     }
-    if (client->response.data != NULL) {
-        free(client->response.data);
-        client->response.data = NULL;
+    if (client->response.buffer.data != NULL) {
+        buffer_free(&client->response.buffer);
+        memset(&client->response, 0, sizeof(response_t));
     }
 }
 
@@ -493,7 +529,7 @@ void set_client_error(client_t* client, http_status_t status_code) {
  * Parse request line, headers, populate `client->request`
  */
 int parse_request_headers(client_t* client) {
-    char* buf = client->buffer;
+    char* buf = client->request.buffer.data;
 
     /**
      * Parse request line
@@ -523,9 +559,9 @@ int parse_request_headers(client_t* client) {
      * Parse headers
      */
     char* p = line_end + 2;
-    char* headers_end = client->buffer + client->headers_len;
+    char* headers_end = client->request.buffer.data + client->request.headers_len;
 
-    client->request.content_len = 0;
+    client->request.body_len = 0;
 
     int headers_count = 0;
 
@@ -549,7 +585,7 @@ int parse_request_headers(client_t* client) {
                 char* end;
                 long len = strtol(value, &end, 10);
                 if (*end != '\0' || len < 0 || len > MAX_REQUEST_SIZE) return 0;
-                client->request.content_len = (int)len;
+                client->request.body_len = (int)len;
             }
             else if (strcasecmp(key, "connection") == 0) {
                 if (strcasecmp(value, "keep-alive") == 0) {
@@ -568,45 +604,45 @@ int parse_request_headers(client_t* client) {
         p = next + 2;
     }
 
-    client->request.body_len = client->request.content_len;
-
     return 1;
 }
 
 void reset_client_for_next_request(client_t* client) {
-    int remaining = client->buffer_len - client->request.headers_len - client->request.content_len;
+    request_t* req = &client->request;
+
+    int remaining = req->buffer.len - req->headers_len - req->body_len;
     if (remaining < 0) remaining = 0;
 
     // Shift buffer
     if (remaining > 0) {
         memmove(
-            client->buffer,
-            client->buffer + client->request.body_offset + client->request.content_len,
+            req->buffer.data,
+            req->buffer.data + req->headers_len + req->body_len,
             remaining
         );
     }
-    client->buffer_len = remaining;
-    client->buffer[client->buffer_len] = '\0';
+    req->buffer.len = remaining;
+    req->buffer.data[req->buffer.len] = '\0';
 
     // Reset parsing state
-    client->headers_done = 0;
-    client->headers_len = 0;
-
-    memset(&client->request, 0, sizeof(request_t));
-    client->request.connection_close = 1;
+    req->headers_done = 0;
+    req->headers_len = 0;
+    req->body_len = 0;
+    req->id = 0;
+    req->method[0] = '\0';
+    req->path[0] = '\0';
+    req->version[0] = '\0';
+    req->connection_close = 1;
 
     // Reset response
-    if (client->response.data) {
-        free(client->response.data);
-        client->response.data = NULL;
-    }
-
+    buffer_free(&client->response.buffer);
     memset(&client->response, 0, sizeof(response_t));
 
-    client->last_activity_ms = now_ms();
     client->state = STATE_READING;
     LOG_CLIENT_DEBUG(client, "state -> READING");
     client->error_code = 0;
+    client->peer_closed = 0;
+    client->last_activity_ms = now_ms();
 }
 
 /**
@@ -618,24 +654,25 @@ void handle_read(client_t* client) {
         /**
          * grow buffer if needed
          */
-        if (client->buffer_len + 1 >= client->buffer_cap) {
-            if (client->buffer_cap > MAX_REQUEST_SIZE / 2) return set_client_error(client, HTTP_400_BAD_REQUEST);
-            client->buffer_cap *= 2;
-            char* tmp = realloc(client->buffer, client->buffer_cap);
-            if (tmp == NULL) return set_client_error(client, HTTP_500_INTERNAL_ERROR);
-            client->buffer = tmp;
+        if (client->request.buffer.len + 1 >= client->request.buffer.cap) {
+            if (client->request.buffer.cap > MAX_REQUEST_SIZE / 2) {
+                return set_client_error(client, HTTP_400_BAD_REQUEST);
+            }
+            if (buffer_reserve(&client->request.buffer, client->request.buffer.len + 1) < 0) {
+                return set_client_error(client, HTTP_500_INTERNAL_ERROR);
+            }
         }
 
         /**
          * read next bytes, handle errors
          */
-        char* write_pos = client->buffer + client->buffer_len;
-        int read_bytes = client->buffer_cap - client->buffer_len - 1; // room left in buffer
+        char* write_pos = client->request.buffer.data + client->request.buffer.len;
+        int read_bytes = client->request.buffer.cap - client->request.buffer.len - 1; // room left in buffer
 
         // cap read to expected content len
-        if (client->headers_done && client->request.content_len > 0) {
+        if (client->request.headers_done && client->request.body_len > 0) {
             // end of expected request = body start + declared content length
-            char* want_end = client->buffer + client->request.body_offset + client->request.content_len;
+            char* want_end = client->request.buffer.data + client->request.headers_len + client->request.body_len;
 
             if (want_end > write_pos) {
                 int remaining = want_end - write_pos;
@@ -651,7 +688,7 @@ void handle_read(client_t* client) {
         }
 
         if (read_bytes == 0) {
-            if (client->headers_done) goto next_step;
+            if (client->request.headers_done) goto next_step;
             else return set_client_error(client, HTTP_400_BAD_REQUEST);
         }
 
@@ -667,7 +704,7 @@ void handle_read(client_t* client) {
             }
             else {
                 LOG_CLIENT_PERROR(client, "read");
-                set_client_error(client, HTTP_400_BAD_REQUEST);
+                return set_client_error(client, HTTP_400_BAD_REQUEST);
             }
         }
 
@@ -679,47 +716,43 @@ void handle_read(client_t* client) {
             LOG_CLIENT_INFO(client, "peer closed connection");
 
             // Case 1: no new request started -> clean close
-            if (!client->headers_done && client->buffer_len == 0) {
+            if (!client->request.headers_done && client->request.buffer.len == 0) {
                 client->state = STATE_DONE;
                 LOG_CLIENT_DEBUG(client, "state -> DONE");
                 return;
             }
 
             // Case 2: partial request -> error
-            if (!client->headers_done) return set_client_error(client, HTTP_400_BAD_REQUEST);
+            if (!client->request.headers_done) return set_client_error(client, HTTP_400_BAD_REQUEST);
 
             // Case 3: headers done, check body
             // If no body expected OR already fully read -> OK
             int body_received = 0;
-            if (client->request.body_offset > 0) {
-                body_received = client->buffer_len - client->request.body_offset;
+            if (client->request.headers_len > 0) {
+                body_received = client->request.buffer.len - client->request.headers_len;
             }
-            if (body_received >= client->request.content_len) goto next_step;
+            if (body_received >= client->request.body_len) goto next_step;
 
             return set_client_error(client, HTTP_400_BAD_REQUEST);
         };
 
-        client->buffer_len += n;
-        client->buffer[client->buffer_len] = '\0';
+        client->request.buffer.len += n;
+        client->request.buffer.data[client->request.buffer.len] = '\0';
         client->last_activity_ms = now_ms();
 
-        if (!client->headers_done && client->buffer_len > MAX_HEADERS_SIZE) {
+        if (!client->request.headers_done && client->request.buffer.len > MAX_HEADERS_SIZE) {
             LOG_CLIENT_ERROR(client, "headers too large");
             return set_client_error(client, HTTP_400_BAD_REQUEST);
         }
 
         // check for headers end
-        if (!client->headers_done) {
-            char* headers_end = strstr(client->buffer, "\r\n\r\n");
+        if (!client->request.headers_done) {
+            char* headers_end = strstr(client->request.buffer.data, "\r\n\r\n");
             if (headers_end != NULL) {
-                client->headers_done = 1;
-                client->request_id = next_request_id++;
+                client->request.headers_done = 1;
+                client->request.id = next_request_id++;
 
-                int headers_len = headers_end - client->buffer + 4;
-                client->headers_len = headers_len;
-
-                client->request.headers_len = headers_len;
-                client->request.body_offset = headers_end + 4 - client->buffer;
+                client->request.headers_len = headers_end - client->request.buffer.data + 4;
 
                 int ok = parse_request_headers(client);
                 if (ok < 0) return set_client_error(client, HTTP_405_NOT_ALLOWED);
@@ -727,10 +760,10 @@ void handle_read(client_t* client) {
             }
         }
 
-        if (client->headers_done) {
-            int body_received = client->buffer_len - client->request.body_offset;
+        if (client->request.headers_done) {
+            int body_received = client->request.buffer.len - client->request.headers_len;
 
-            if (body_received >= client->request.content_len) goto next_step;
+            if (body_received >= client->request.body_len) goto next_step;
         }
     }
     return;
@@ -738,12 +771,12 @@ void handle_read(client_t* client) {
 next_step: {
     LOG_CLIENT_INFO(client,
         "request: %s %s (body=%d)",
-        client->request.method, client->request.path, client->request.content_len);
+        client->request.method, client->request.path, client->request.body_len);
     LOG_CLIENT_DUMP(client,
         "request:\n---\n"
         "%.*s"
         "\n---",
-        client->request.headers_len + client->request.body_len, client->buffer
+        client->request.headers_len + client->request.body_len, client->request.buffer.data
     );
 
     client->state = STATE_HANDLING;
@@ -769,13 +802,13 @@ int response_build(
 
     int total_cap = header_cap + body_len;
 
-    res->data = malloc(total_cap);
-    if (!res->data) return 0;
+    res->buffer.data = malloc(total_cap);
+    if (!res->buffer.data) return 0;
 
     const char* conn = connection_close ? "close" : "keep-alive";
 
     int header_len = snprintf(
-        res->data,
+        res->buffer.data,
         header_cap,
         "HTTP/1.1 %d %s\r\n"
         "Content-Type: %s\r\n"
@@ -790,15 +823,15 @@ int response_build(
     );
 
     if (header_len < 0 || header_len >= header_cap) {
-        free(res->data);
+        free(res->buffer.data);
         return 0;
     }
 
     if (body_len > 0 && body != NULL) {
-        memcpy(res->data + header_len, body, body_len);
+        memcpy(res->buffer.data + header_len, body, body_len);
     }
 
-    res->len = header_len + body_len;
+    res->buffer.len = header_len + body_len;
     res->sent = 0;
     res->status_code = status_code;
     res->connection_close = connection_close;
@@ -834,8 +867,8 @@ int create_error_response(client_t* client, http_status_t code) {
 // ----------------------------------------------
 
 void create_echo_response(client_t* client) {
-    int body_len = client->request.content_len;
-    const char* body = client->buffer + client->request.body_offset;
+    int body_len = client->request.body_len;
+    const char* body = client->request.buffer.data + client->request.headers_len;
 
     if (!body) body_len = 0;
 
@@ -1067,12 +1100,12 @@ void handle_request(client_t* client, server_config_t* config) {
 
     LOG_CLIENT_INFO(client,
         "response: %d (%d bytes, conn=%s)",
-        client->response.status_code, client->response.len, client->response.connection_close ? "close" : "keep-alive");
+        client->response.status_code, client->response.buffer.len, client->response.connection_close ? "close" : "keep-alive");
     LOG_CLIENT_DUMP(client,
         "response:\n---\n"
         "%.*s"
         "\n---",
-        client->response.len, client->response.data
+        client->response.buffer.len, client->response.buffer.data
     );
 }
 
@@ -1087,14 +1120,14 @@ void handle_request(client_t* client, server_config_t* config) {
 void handle_write(client_t* client) {
     response_t* res = &client->response;
 
-    while (res->sent < res->len) {
-        LOG_CLIENT_DUMP(client, "write progress: %d/%d bytes", res->sent, res->len);
+    while (res->sent < res->buffer.len) {
+        LOG_CLIENT_DUMP(client, "write progress: %d/%d bytes", res->sent, res->buffer.len);
 
         // write next bytes
         ssize_t n = write(
             client->fd,
-            res->data + res->sent,
-            res->len - res->sent
+            res->buffer.data + res->sent,
+            res->buffer.len - res->sent
         );
 
         LOG_CLIENT_DUMP(client, "wrote %zd bytes", n);
@@ -1287,18 +1320,9 @@ void init_server_event_loop(server_config_t* config) {
                     continue;
                 }
 
-                int buffer_cap = 4096;
-                char* buffer = malloc(sizeof(char) * buffer_cap);
-                if (buffer == NULL) {
-                    LOG_ERROR("[c=%d] failed to allocate request buffer", next_client_id);
-                    close(client_fd);
-                    continue;
-                }
-
                 pfds[nfds].fd = client_fd;
 
                 memset(&clients[nfds], 0, sizeof(client_t));
-
                 clients[nfds].id = next_client_id++;
                 clients[nfds].state = STATE_READING;
                 clients[nfds].fd = client_fd;
@@ -1307,22 +1331,26 @@ void init_server_event_loop(server_config_t* config) {
                 clients[nfds].peer_closed = 0;
                 clients[nfds].error_code = 0;
 
-                clients[nfds].buffer = buffer;
-                clients[nfds].buffer_len = 0;
-                clients[nfds].buffer_cap = buffer_cap;
-
                 memset(&clients[nfds].request, 0, sizeof(request_t));
+                if (buffer_init(&clients[nfds].request.buffer, 4096) < 0) {
+                    LOG_ERROR("[c=%d] failed to allocate request buffer", next_client_id);
+                    close(client_fd);
+                    continue;
+                }
                 clients[nfds].request.connection_close = 0; // default HTTP/1.1 behavior
-
-                clients[nfds].headers_done = 0;
-                clients[nfds].headers_len = 0;
+                clients[nfds].request.headers_done = 0;
+                clients[nfds].request.headers_len = 0;
 
                 memset(&clients[nfds].response, 0, sizeof(response_t));
+                if (buffer_init(&clients[nfds].response.buffer, 4096) < 0) {
+                    LOG_ERROR("[c=%d] failed to allocate response buffer", next_client_id);
+                    buffer_free(&clients[nfds].request.buffer);
+                    close(client_fd);
+                    continue;
+                }
 
                 LOG_CLIENT_DEBUG(&clients[nfds], "connection accepted");
-
                 nfds++;
-
                 continue;
             }
 
@@ -1365,7 +1393,7 @@ void init_server_event_loop(server_config_t* config) {
                 handle_write(client);
             }
 
-            if (client->state == STATE_READING && client->buffer_len > 0 && !client->peer_closed) {
+            if (client->state == STATE_READING && client->request.buffer.len > 0 && !client->peer_closed) {
                 // try to parse next request immediately (pipeline)
                 LOG_CLIENT_DEBUG(client, "pipeline read");
                 handle_read(client);
