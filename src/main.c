@@ -44,13 +44,14 @@
 #include <stdio.h>      // printf(), perror()
 #include <stdlib.h>     // exit(), EXIT_FAILURE
 #include <string.h>     // memset()
+#include <strings.h>    // strcasecmp()
 #include <unistd.h>     // close()
-#include <arpa/inet.h>  // htons(), htonl(), sockaddr_in, INADDR_ANY
+#include <arpa/inet.h>  // htons(), htonl(), sockaddr_in, INADDR_ANY, inet_pton
 #include <sys/socket.h> // socket(), bind(), listen(), setsockopt()
 #include <signal.h>     // signal(), sigaction()
 #include <errno.h>      // EINTR
 #include <poll.h>       // poll()
-#include <limits.h>     // INT_MAX
+#include <limits.h>     // INT_MAX, PATH_MAX
 #include <fcntl.h>      // fcntl(), O_NONBLOCK
 #include <time.h>       // timespec, clock_gettime
 #include <sys/stat.h>   // stat()
@@ -267,7 +268,7 @@ void log_msg(log_level_t level, const char* fmt, ...) {
 // Signal handlers
 // ----------------------------------------------
 
-/*
+/**
  * Global flag for graceful shutdown.
  *
  * volatile: prevents compiler from caching the value in a register,
@@ -277,7 +278,7 @@ void log_msg(log_level_t level, const char* fmt, ...) {
  */
 volatile sig_atomic_t keep_running = 1;
 
-/*
+/**
  * Signal handler for SIGINT and SIGTERM.
  *
  * When triggered, sets keep_running to 0 to signal the main
@@ -290,7 +291,7 @@ void signal_handler(int signum) {
 }
 
 void setup_signal_handlers() {
-    /*
+    /**
      * Set up signal handlers for graceful shutdown
      *
      * SIGINT:  Sent when user presses Ctrl+C
@@ -318,7 +319,7 @@ void setup_signal_handlers() {
         exit(EXIT_FAILURE);
     }
 
-    /*
+    /**
      * If client closes connection / crashed / reset the socket
      * during sending response with `write()` -> kernel may send SIGPIPE
      * by default it terminates the process immediately
@@ -353,7 +354,7 @@ int set_nonblocking(int fd) {
 }
 
 int setup_server() {
-    /*
+    /**
      * STEP 1: Create a socket
      *
      * socket(domain, type, protocol)
@@ -373,7 +374,7 @@ int setup_server() {
         exit(EXIT_FAILURE);
     }
 
-    /*
+    /**
      * STEP 2: Set socket options
      *
      * setsockopt() allows configuration of socket behavior.
@@ -392,16 +393,24 @@ int setup_server() {
     struct sockaddr_in address;
     memset(&address, 0, sizeof(address));
 
-    /*
+    /**
      * htons() converts 16-bit values to network byte order.
      * htonl() converts 32-bit values to network byte order.
      */
-    address.sin_family = AF_INET;                       // IPv4
-    address.sin_port = htons(PORT);                     // Convert port to network byte order
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   // localhost => 127.0.0.1
-    // address.sin_addr.s_addr = htonl(INADDR_ANY);     // all available network interfaces => 0.0.0.0
+    address.sin_family = AF_INET; // IPv4
+    address.sin_port = htons(PORT);
 
-    /*
+    // all available network interfaces => 0.0.0.0
+    // address.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    // INADDR_LOOPBACK (localhost, 127.0.0.1) can cause portability issues
+    // address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) != 1) {
+        LOG_PERROR("inet_pton failed");
+        exit(EXIT_FAILURE);
+    }
+
+    /**
      * bind(socket, address, address_length)
      *
      * We cast sockaddr_in* to sockaddr* because the API is generic.
@@ -412,7 +421,7 @@ int setup_server() {
         exit(EXIT_FAILURE);
     }
 
-    /*
+    /**
      * STEP 4: Start listening for incoming connections
      *
      * listen(socket, backlog)

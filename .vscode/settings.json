@@ -8,4 +8,11 @@
   "C_Cpp.vcFormat.newLine.beforeOpenBrace.namespace": "sameLine",
   "C_Cpp.vcFormat.newLine.closeBraceSameLine.emptyFunction": true,
   "C_Cpp.vcFormat.newLine.closeBraceSameLine.emptyType": true,
+  "C_Cpp.default.cStandard": "c11",
+  "C_Cpp.default.compilerArgs": [
+    "-D_POSIX_C_SOURCE=200809L",
+    "-Wall",
+    "-Wextra",
+    "-std=c11"
+  ],
 }
