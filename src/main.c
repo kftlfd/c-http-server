@@ -19,7 +19,7 @@
  * - limited MIME type detection
  * - no range requests (partial content)
  * - no directory listing
- * - no URL decoding (%20 etc.)
+ * - no URL decoding (%20 etc.), no query strings (?a=1)
  * - strict path validation (may reject some valid URLs)
  * - no concurrency beyond poll() (single-threaded)
  * - fixed limits:
@@ -338,6 +338,20 @@ void setup_signal_handlers() {
 // Server setup
 // ----------------------------------------------
 
+/**
+ * Set non-blocking mode for socket
+ */
+int set_nonblocking(int fd) {
+    /**
+     * Set non-blocking mode for socket
+     * fcntl = "file control", get/modify properties of file descriptor
+     * nonblock -> on read() and write()
+     */
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
 int setup_server() {
     /*
      * STEP 1: Create a socket
@@ -351,6 +365,11 @@ int setup_server() {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         LOG_PERROR("socket failed");
+        exit(EXIT_FAILURE);
+    }
+
+    if (set_nonblocking(server_fd) < 0) {
+        LOG_PERROR("fcntl server_fd");
         exit(EXIT_FAILURE);
     }
 
@@ -413,20 +432,6 @@ int setup_server() {
 // ----------------------------------------------
 // Main loop helpers
 // ----------------------------------------------
-
-/**
- * Set non-blocking mode for socket
- */
-int set_nonblocking(int fd) {
-    /**
-     * Set non-blocking mode for socket
-     * fcntl = "file control", get/modify properties of file descriptor
-     * nonblock -> on read() and write()
-     */
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags < 0) return -1;
-    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
 
 /**
  * Free allocated memory for client
@@ -621,7 +626,7 @@ void handle_read(client_t* client) {
          * read next bytes, handle errors
          */
         char* write_pos = client->buffer + client->buffer_len;
-        size_t read_bytes = client->buffer_cap - client->buffer_len - 1; // room left in buffer
+        int read_bytes = client->buffer_cap - client->buffer_len - 1; // room left in buffer
 
         // cap read to expected content len
         if (client->headers_done && client->request.content_len > 0) {
@@ -629,7 +634,7 @@ void handle_read(client_t* client) {
             char* want_end = client->request.body + client->request.content_len;
 
             if (want_end > write_pos) {
-                size_t remaining = want_end - write_pos;
+                int remaining = want_end - write_pos;
                 if (remaining < 0) remaining = 0;
                 if (remaining < read_bytes) read_bytes = remaining;
             }
@@ -888,7 +893,7 @@ int resolve_path(char* out, size_t cap, server_config_t* config, const char* url
         if (n < 0 || (size_t)n >= sizeof(path)) return 0;
 
         if (file_exists(path, &is_dir) && !is_dir) {
-            int n = snprintf(out, cap, "%s", path);
+            n = snprintf(out, cap, "%s", path);
             if (n < 0 || (size_t)n >= cap) return 0;
             return 1;
         }
@@ -1093,6 +1098,10 @@ void handle_write(client_t* client) {
         if (n <= 0) {
             if (errno == EINTR) continue;
             else if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+            else if (errno == EPIPE) {
+                LOG_CLIENT_DEBUG(client, "write errno EPIPE");
+                goto done_next;
+            }
             else {
                 LOG_CLIENT_PERROR(client, "write");
                 client->state = STATE_ERROR;
@@ -1106,11 +1115,17 @@ void handle_write(client_t* client) {
     }
 
     if (res->connection_close || client->peer_closed) {
-        client->state = STATE_DONE;
-        LOG_CLIENT_DEBUG(client, "state -> DONE");
+        goto done_next;
     }
     else {
         reset_client_for_next_request(client);
+        return;
+    }
+
+done_next: {
+    client->state = STATE_DONE;
+    LOG_CLIENT_DEBUG(client, "state -> DONE");
+    return;
     }
 }
 
@@ -1438,5 +1453,8 @@ int main(int argc, char** argv) {
     config.keep_alive_timeout_ms = 5000;
 
     init_server_event_loop(&config);
+
+    if (config.fs_root) free(config.fs_root);
+
     return 0;
 }
