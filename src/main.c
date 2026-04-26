@@ -105,16 +105,14 @@ typedef enum HttpStatus {
 
 typedef struct Request {
     int headers_len;
+    int body_offset;
     int body_len;
+    int content_len;
+    int connection_close; // 1 = close, 0 = keep-alive
 
     char method[8];
     char path[1024];
     char version[16];
-
-    int content_len;
-    int connection_close; // 1 = close, 0 = keep-alive
-
-    char* body;
 } request_t;
 
 typedef struct Response {
@@ -449,7 +447,7 @@ void free_client(client_t* client) {
     if (client->buffer != NULL) {
         free(client->buffer);
         client->buffer = NULL;
-        client->request.body = NULL;
+        client->request.body_offset = 0;
     }
     if (client->response.data != NULL) {
         free(client->response.data);
@@ -583,7 +581,7 @@ void reset_client_for_next_request(client_t* client) {
     if (remaining > 0) {
         memmove(
             client->buffer,
-            client->request.body + client->request.content_len,
+            client->buffer + client->request.body_offset + client->request.content_len,
             remaining
         );
     }
@@ -623,12 +621,9 @@ void handle_read(client_t* client) {
         if (client->buffer_len + 1 >= client->buffer_cap) {
             if (client->buffer_cap > MAX_REQUEST_SIZE / 2) return set_client_error(client, HTTP_400_BAD_REQUEST);
             client->buffer_cap *= 2;
-            int body_offset = -1;
-            if (client->request.body != NULL) body_offset = client->request.body - client->buffer;
             char* tmp = realloc(client->buffer, client->buffer_cap);
             if (tmp == NULL) return set_client_error(client, HTTP_500_INTERNAL_ERROR);
             client->buffer = tmp;
-            if (body_offset >= 0) client->request.body = client->buffer + body_offset;
         }
 
         /**
@@ -640,7 +635,7 @@ void handle_read(client_t* client) {
         // cap read to expected content len
         if (client->headers_done && client->request.content_len > 0) {
             // end of expected request = body start + declared content length
-            char* want_end = client->request.body + client->request.content_len;
+            char* want_end = client->buffer + client->request.body_offset + client->request.content_len;
 
             if (want_end > write_pos) {
                 int remaining = want_end - write_pos;
@@ -696,8 +691,8 @@ void handle_read(client_t* client) {
             // Case 3: headers done, check body
             // If no body expected OR already fully read -> OK
             int body_received = 0;
-            if (client->request.body) {
-                body_received = (client->buffer + client->buffer_len) - client->request.body;
+            if (client->request.body_offset > 0) {
+                body_received = client->buffer_len - client->request.body_offset;
             }
             if (body_received >= client->request.content_len) goto next_step;
 
@@ -724,7 +719,7 @@ void handle_read(client_t* client) {
                 client->headers_len = headers_len;
 
                 client->request.headers_len = headers_len;
-                client->request.body = headers_end + 4;
+                client->request.body_offset = headers_end + 4 - client->buffer;
 
                 int ok = parse_request_headers(client);
                 if (ok < 0) return set_client_error(client, HTTP_405_NOT_ALLOWED);
@@ -733,7 +728,7 @@ void handle_read(client_t* client) {
         }
 
         if (client->headers_done) {
-            int body_received = (client->buffer + client->buffer_len) - client->request.body;
+            int body_received = client->buffer_len - client->request.body_offset;
 
             if (body_received >= client->request.content_len) goto next_step;
         }
@@ -840,7 +835,7 @@ int create_error_response(client_t* client, http_status_t code) {
 
 void create_echo_response(client_t* client) {
     int body_len = client->request.content_len;
-    const char* body = client->request.body;
+    const char* body = client->buffer + client->request.body_offset;
 
     if (!body) body_len = 0;
 
