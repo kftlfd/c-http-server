@@ -155,6 +155,11 @@ typedef struct Client {
     response_t response;
 } client_t;
 
+typedef enum ClientStepResult {
+    CLIENT_RES_CLOSE,
+    CLIENT_RES_KEEP
+} client_res_t;
+
 typedef struct pollfd pollfd_t;
 
 static int next_client_id = 1;
@@ -1139,7 +1144,121 @@ void client_post_write(client_t* client) {
 // Main loop
 // ----------------------------------------------
 
-void init_server_event_loop(server_config_t* config) {
+void accept_client_connection(int server_fd, pollfd_t* pfds, client_t* clients, int* nfds_ptr) {
+    LOG_DEBUG("new connection c=>%d", next_client_id);
+
+    /**
+     * What accept() does
+     *  1. Takes one connection from the queue
+     *  2. Creates a new socket (client_fd)
+     *  3. Returns client address info (optional)
+     *
+     * Important behavior: Blocking call by default → waits until a client connects
+     */
+
+    struct sockaddr_in client_addr = { 0 };
+    socklen_t client_addr_len = sizeof(client_addr);
+    int client_fd = accept(
+        server_fd,
+        (struct sockaddr*)&client_addr,
+        &client_addr_len
+    );
+    if (client_fd < 0) {
+        if (errno != EINTR) LOG_PERROR("[c=%d] accept", next_client_id);
+        return; // don't kill server, go to next connection
+    }
+
+    if (set_nonblocking(client_fd) < 0) {
+        LOG_PERROR("[c=%d] fcntl failed", next_client_id);
+        close(client_fd);
+        return;
+    }
+
+    int nfds = *nfds_ptr;
+
+    if (nfds >= MAX_CLIENTS + 1) {
+        LOG_WARN("[c=%d] too many clients, dropping connection", next_client_id);
+        close(client_fd);
+        return;
+    }
+
+    pfds[nfds].fd = client_fd;
+
+    memset(&clients[nfds], 0, sizeof(client_t));
+    clients[nfds].id = next_client_id++;
+    clients[nfds].state = STATE_READING;
+    clients[nfds].fd = client_fd;
+    clients[nfds].addr = client_addr;
+    clients[nfds].last_activity_ms = now_ms();
+    clients[nfds].peer_closed = 0;
+    clients[nfds].error_code = 0;
+
+    memset(&clients[nfds].request, 0, sizeof(request_t));
+    if (buffer_init(&clients[nfds].request.buffer, 4096) < 0) {
+        LOG_ERROR("[c=%d] failed to allocate request buffer", next_client_id);
+        close(client_fd);
+        return;
+    }
+    clients[nfds].request.connection = CONN_KEEP_ALIVE; // default HTTP/1.1 behavior
+    clients[nfds].request.headers_len = 0;
+
+    memset(&clients[nfds].response, 0, sizeof(response_t));
+
+    LOG_CLIENT_DEBUG(&clients[nfds], "connection accepted");
+
+    (*nfds_ptr)++;
+}
+
+client_res_t client_step(pollfd_t* pfds, client_t* clients, int i, server_config_t* config) {
+    client_t* client = &clients[i];
+    LOG_CLIENT_DEBUG(client, "client ready");
+
+    /**
+     * Client read/write ready
+     *
+     * After accept
+     *  - read from client_fd
+     *  - write to client_fd
+     *  - close client_fd when done
+     */
+
+    while (1) {
+        if (client->state == STATE_READING) {
+            if (!(pfds[i].revents & POLLIN)) break;
+            pfds[i].revents &= ~POLLIN; // consume event
+
+            LOG_CLIENT_DEBUG(client, "read ready");
+            client_read_request(client);
+            client_parse_request(client);
+        }
+
+        else if (client->state == STATE_HANDLING) {
+            LOG_CLIENT_DEBUG(client, "handling");
+            client_handle_request(client, config);
+        }
+
+        else if (client->state == STATE_WRITING) {
+            LOG_CLIENT_DEBUG(client, "write ready");
+            client_write_response(client);
+            client_post_write(client);
+
+            // write is blocked
+            if (client->state == STATE_WRITING) break;
+        }
+
+        else break;
+    }
+
+    if (client->state == STATE_DONE || client->state == STATE_ERROR) {
+        if (client->state == STATE_DONE) LOG_CLIENT_DEBUG(client, "done");
+        else LOG_CLIENT_DEBUG(client, "error");
+        return CLIENT_RES_CLOSE;
+    }
+
+    return CLIENT_RES_KEEP;
+}
+
+void start_server(server_config_t* config) {
     setup_signal_handlers();
 
     int server_fd = setup_server();
@@ -1255,73 +1374,15 @@ void init_server_event_loop(server_config_t* config) {
             if (pfds[i].fd == server_fd) {
                 if (!(pfds[i].revents & POLLIN)) continue;
 
-                LOG_DEBUG("new connection c=>%d", next_client_id);
-
-                /**
-                 * What accept() does
-                 *  1. Takes one connection from the queue
-                 *  2. Creates a new socket (client_fd)
-                 *  3. Returns client address info (optional)
-                 *
-                 * Important behavior: Blocking call by default → waits until a client connects
-                 */
-                struct sockaddr_in client_addr = { 0 };
-                socklen_t client_addr_len = sizeof(client_addr);
-                int client_fd = accept(
-                    server_fd,
-                    (struct sockaddr*)&client_addr,
-                    &client_addr_len
-                );
-                if (client_fd < 0) {
-                    if (errno != EINTR) LOG_PERROR("[c=%d] accept", next_client_id);
-                    continue; // don't kill server, go to next connection
-                }
-
-                if (set_nonblocking(client_fd) < 0) {
-                    LOG_PERROR("[c=%d] fcntl failed", next_client_id);
-                    close(client_fd);
-                    continue;
-                }
-
-                if (nfds >= MAX_CLIENTS + 1) {
-                    LOG_WARN("[c=%d] too many clients, dropping connection", next_client_id);
-                    close(client_fd);
-                    continue;
-                }
-
-                pfds[nfds].fd = client_fd;
-
-                memset(&clients[nfds], 0, sizeof(client_t));
-                clients[nfds].id = next_client_id++;
-                clients[nfds].state = STATE_READING;
-                clients[nfds].fd = client_fd;
-                clients[nfds].addr = client_addr;
-                clients[nfds].last_activity_ms = now_ms();
-                clients[nfds].peer_closed = 0;
-                clients[nfds].error_code = 0;
-
-                memset(&clients[nfds].request, 0, sizeof(request_t));
-                if (buffer_init(&clients[nfds].request.buffer, 4096) < 0) {
-                    LOG_ERROR("[c=%d] failed to allocate request buffer", next_client_id);
-                    close(client_fd);
-                    continue;
-                }
-                clients[nfds].request.connection = CONN_KEEP_ALIVE; // default HTTP/1.1 behavior
-                clients[nfds].request.headers_len = 0;
-
-                memset(&clients[nfds].response, 0, sizeof(response_t));
-
-                LOG_CLIENT_DEBUG(&clients[nfds], "connection accepted");
-                nfds++;
+                accept_client_connection(server_fd, pfds, clients, &nfds);
                 continue;
             }
-
-            client_t* client = &clients[i];
 
             /**
              * Socket error
              */
             if (pfds[i].revents & (POLLERR | POLLNVAL)) {
+                client_t* client = &clients[i];
                 if (pfds[i].revents & POLLERR) LOG_CLIENT_ERROR(client, "socket error: POLLERR");
                 else LOG_CLIENT_ERROR(client, "socket error: POLLNVAL");
                 close_client(pfds, clients, &nfds, i);
@@ -1329,50 +1390,11 @@ void init_server_event_loop(server_config_t* config) {
                 continue;
             }
 
-            /**
-             * Client read/write ready
-             *
-             * After accept
-             *  - read from client_fd
-             *  - write to client_fd
-             *  - close client_fd when done
-             */
+            client_res_t res = client_step(pfds, clients, i, config);
 
-            LOG_CLIENT_DEBUG(client, "client ready");
-
-            while (1) {
-                if (client->state == STATE_READING) {
-                    if (!(pfds[i].revents & POLLIN)) break;
-                    pfds[i].revents &= ~POLLIN; // consume event
-
-                    LOG_CLIENT_DEBUG(client, "read ready");
-                    client_read_request(client);
-                    client_parse_request(client);
-                }
-
-                else if (client->state == STATE_HANDLING) {
-                    LOG_CLIENT_DEBUG(client, "handling");
-                    client_handle_request(client, config);
-                }
-
-                else if (client->state == STATE_WRITING) {
-                    LOG_CLIENT_DEBUG(client, "write ready");
-                    client_write_response(client);
-                    client_post_write(client);
-
-                    // write is blocked
-                    if (client->state == STATE_WRITING) break;
-                }
-
-                else break;
-            }
-
-            if (client->state == STATE_DONE || client->state == STATE_ERROR) {
-                if (client->state == STATE_DONE) LOG_CLIENT_DEBUG(client, "done");
-                else LOG_CLIENT_DEBUG(client, "error");
+            if (res == CLIENT_RES_CLOSE) {
                 close_client(pfds, clients, &nfds, i);
                 i--;
-                continue;
             }
         }
     }
@@ -1440,7 +1462,7 @@ int main(int argc, char** argv) {
 
     config.keep_alive_timeout_ms = 5000;
 
-    init_server_event_loop(&config);
+    start_server(&config);
 
     if (config.fs_root) free(config.fs_root);
 
