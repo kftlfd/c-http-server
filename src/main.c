@@ -1,9 +1,9 @@
 /**
  * HTTP echo / static files server
- * - non-blocking I/O (poll-based event loop)
+ * - non-blocking I/O (poll-based event loop, process client until blocked)
  * - per-client state machine (read -> handle -> write)
  * - HTTP/1.1 keep-alive support
- * - basic request parsing (request line + headers)
+ * - basic request parsing (request line + some headers)
  * - static file serving (GET + HEAD)
  * - simple routing (/, .html fallback, index.html)
  * - connection timeouts
@@ -12,6 +12,7 @@
   * Limitations:
  * - only HTTP/1.1 (no HTTP/2, no TLS)
  * - only GET+HEAD supported in fs mode (no POST, etc.)
+ * - no "Host" header validation (HTTP/1.1 requirement)
  * - no "Transfer-Encoding: chunked"
  * - no request streaming (entire request buffered)
  * - no response streaming (entire file buffered in memory)
@@ -30,15 +31,20 @@
  * Security notes:
  * - prevents directory traversal ("..")
  * - restricts allowed path characters
- * - does not follow symlinks explicitly (depends on stat)
+ * - follows symlinks via `stat()` (not restricted)
  * - not hardened for production use
  *
  * TODO:
+ * - retry reading files until `size`
  * - sendfile() / streaming responses for large files
  * - LRU file cache
  * - more complete MIME type handling
  * - configuration (port, limits, timeouts)
  * - `writev() + `struct iovec` (`<sys/uio.h>`) for concurrency-safe logs
+ * - don't operate directly on `request.buffer` during parsing
+ * - split Request into `raw_request_t` (buffer + lengths) and `http_request_t` (method, path, headers)
+ * - split `create_fs_response` function
+ * - use `epoll`/`kqueue` instead of `poll`
  */
 
 #include <stdio.h>      // printf(), perror()
@@ -110,6 +116,11 @@ typedef enum ParseResult {
     PARSE_NOT_SUPPORTED
 } parse_result_t;
 
+typedef enum Connection {
+    CONN_CLOSE,
+    CONN_KEEP_ALIVE
+} conn_t;
+
 typedef struct Buffer {
     char* data;
     int len;
@@ -120,15 +131,13 @@ typedef struct Request {
     int id;
     buffer_t buffer;
 
-    int headers_done;
-    int connection_close; // 1 = close, 0 = keep-alive
-
     int headers_len;
     int body_len;
 
     char method[8];
     char path[1024];
     char version[16];
+    conn_t connection;
 } request_t;
 
 typedef struct Response {
@@ -136,7 +145,7 @@ typedef struct Response {
     int sent;
 
     int status_code;
-    int connection_close; // 1 = close, 0 = keep-alive
+    conn_t connection;
 } response_t;
 
 typedef struct Client {
@@ -152,6 +161,11 @@ typedef struct Client {
     response_t response;
 } client_t;
 
+typedef enum ClientStepResult {
+    CLIENT_RES_CLOSE,
+    CLIENT_RES_KEEP
+} client_res_t;
+
 typedef struct pollfd pollfd_t;
 
 static int next_client_id = 1;
@@ -161,6 +175,32 @@ long now_ms() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (ts.tv_sec * 1000L) + (ts.tv_nsec / 1000000L);
+}
+
+const char* state_str(client_state_t s) {
+    switch (s) {
+    case STATE_READING: return "READ";
+    case STATE_HANDLING: return "HANDL";
+    case STATE_WRITING: return "WRITE";
+    case STATE_DONE: return "DONE";
+    case STATE_ERROR: return "ERROR";
+    default: return "?";
+    }
+}
+
+const char* connection_str(conn_t conn) {
+    return conn == CONN_CLOSE ? "close" : "keep-alive";
+}
+
+const char* log_level_str(log_level_t level) {
+    switch (level) {
+    case LOG_L_DUMP: return "DUMP";
+    case LOG_L_DEBUG: return "DEBUG";
+    case LOG_L_INFO: return "INFO";
+    case LOG_L_WARN: return "WARN";
+    case LOG_L_ERROR: return "ERROR";
+    default: return "?";
+    }
 }
 
 // ----------------------------------------------
@@ -176,28 +216,6 @@ int parse_log_level(const char* s, log_level_t* out) {
     if (strcmp(s, "warn") == 0) { *out = LOG_L_WARN; return 1; }
     if (strcmp(s, "error") == 0) { *out = LOG_L_ERROR; return 1; }
     return 0;
-}
-
-const char* state_str(client_state_t s) {
-    switch (s) {
-    case STATE_READING: return "READ";
-    case STATE_HANDLING: return "HANDL";
-    case STATE_WRITING: return "WRITE";
-    case STATE_DONE: return "DONE";
-    case STATE_ERROR: return "ERROR";
-    default: return "?";
-    }
-}
-
-const char* log_level_str(log_level_t level) {
-    switch (level) {
-    case LOG_L_DUMP: return "DUMP";
-    case LOG_L_DEBUG: return "DEBUG";
-    case LOG_L_INFO: return "INFO";
-    case LOG_L_WARN: return "WARN";
-    case LOG_L_ERROR: return "ERROR";
-    default: return "?";
-    }
 }
 
 void get_ts_local(struct timespec* ts, char* out, int out_len) {
@@ -247,11 +265,13 @@ void log_msg(log_level_t level, const char* fmt, ...) {
 #define LOG_WARN(fmt, ...) log_msg(LOG_L_WARN, fmt, ##__VA_ARGS__)
 #define LOG_ERROR(fmt, ...) log_msg(LOG_L_ERROR, fmt, ##__VA_ARGS__)
 
-#define LOG_PERROR(fmt, ...) \
+#define LOG_PERROR_LEVEL(level, fmt, ...) \
     do { \
         int err = errno; \
-        log_msg(LOG_L_ERROR, fmt ": %s", ##__VA_ARGS__, strerror(err)); \
+        log_msg(level, fmt ": %s", ##__VA_ARGS__, strerror(err)); \
     } while (0)
+
+#define LOG_PERROR(fmt, ...) LOG_PERROR_LEVEL(LOG_L_ERROR, fmt, ##__VA_ARGS__)
 
 #define LOG_CLIENT(level, client, fmt, ...) \
     log_msg(level, "[c=%d fd=%d req=%d state=%s]\t" fmt, \
@@ -264,10 +284,13 @@ void log_msg(log_level_t level, const char* fmt, ...) {
 #define LOG_CLIENT_WARN(client, fmt, ...) LOG_CLIENT(LOG_L_WARN, client, fmt, ##__VA_ARGS__)
 #define LOG_CLIENT_ERROR(client, fmt, ...) LOG_CLIENT(LOG_L_ERROR, client, fmt, ##__VA_ARGS__)
 
-#define LOG_CLIENT_PERROR(client, fmt, ...) \
-    LOG_PERROR("[c=%d fd=%d req=%d state=%s]\t" fmt, \
+#define LOG_CLIENT_PERROR_LEVEL(level, client, fmt, ...) \
+    LOG_PERROR_LEVEL(level, "[c=%d fd=%d req=%d state=%s]\t" fmt, \
         (client)->id, (client)->fd, (client)->request.id, \
         state_str((client)->state), ##__VA_ARGS__)
+
+#define LOG_CLIENT_PERROR(client, fmt, ...) LOG_CLIENT_PERROR_LEVEL(LOG_L_ERROR, client, fmt, ##__VA_ARGS__)
+#define LOG_CLIENT_PERROR_DUMP(client, fmt, ...) LOG_CLIENT_PERROR_LEVEL(LOG_L_DUMP, client, fmt, ##__VA_ARGS__)
 
 // ----------------------------------------------
 // Buffer helpers
@@ -555,6 +578,7 @@ void client_read_request(client_t* client) {
         ssize_t n = read(client->fd, buf->data + buf->len, buf->cap - buf->len - 1);
 
         if (n < 0) {
+            LOG_CLIENT_PERROR_DUMP(client, "read");
             if (errno == EINTR) continue; // interrupted, can try read again immediately
             if (errno == EAGAIN || errno == EWOULDBLOCK) break; // read blocked, try in next poll iteration
 
@@ -564,9 +588,11 @@ void client_read_request(client_t* client) {
 
         if (n == 0) {
             client->peer_closed = 1;
+            LOG_CLIENT_DUMP(client, "read EOF => peer_closed=1");
             break;
         }
 
+        LOG_CLIENT_DUMP(client, "read %d bytes", n);
         buf->len += n;
         buf->data[buf->len] = '\0';
         client->last_activity_ms = now_ms();
@@ -587,7 +613,7 @@ parse_result_t parse_request_headers(client_t* client) {
      * Parse request line
      */
     char* line_end = strstr(buf, "\r\n");
-    if (!line_end) return PARSE_ERROR;
+    if (!line_end) return PARSE_INCOMPLETE;
 
     *line_end = '\0';
 
@@ -600,11 +626,9 @@ parse_result_t parse_request_headers(client_t* client) {
 
     *line_end = '\r';
 
+    client->request.connection = CONN_CLOSE;
     if (strcmp(client->request.version, "HTTP/1.1") == 0) {
-        client->request.connection_close = 0;
-    }
-    else {
-        client->request.connection_close = 1;
+        client->request.connection = CONN_KEEP_ALIVE;
     }
 
     /**
@@ -641,10 +665,10 @@ parse_result_t parse_request_headers(client_t* client) {
             }
             else if (strcasecmp(key, "connection") == 0) {
                 if (strcasecmp(value, "keep-alive") == 0) {
-                    client->request.connection_close = 0;
+                    client->request.connection = CONN_KEEP_ALIVE;
                 }
                 else if (strcasecmp(value, "close") == 0) {
-                    client->request.connection_close = 1;
+                    client->request.connection = CONN_CLOSE;
                 }
             }
             else if (strcasecmp(key, "transfer-encoding") == 0) {
@@ -663,31 +687,31 @@ parse_result_t try_parse_request(client_t* client) {
     request_t* req = &client->request;
     buffer_t* buf = &req->buffer;
 
-    if (!req->headers_done) {
-        char* headers_end = strstr(buf->data, "\r\n\r\n");
+    if (req->headers_len > 0) {
+        int body_received = buf->len - req->headers_len;
+        if (body_received < req->body_len) return PARSE_INCOMPLETE;
 
-        if (!headers_end) {
-            if (buf->len > MAX_HEADERS_SIZE) return PARSE_ERROR;
-            return PARSE_INCOMPLETE;
-        }
-
-        req->headers_done = 1;
-        req->headers_len = headers_end + 4 - buf->data;
-        req->id = next_request_id++;
-
-        return parse_request_headers(client);
+        return PARSE_OK;
     }
 
-    int body_received = buf->len - req->headers_len;
-    if (body_received < req->body_len) return PARSE_INCOMPLETE;
+    char* headers_end = strstr(buf->data, "\r\n\r\n");
 
-    return PARSE_OK;
+    if (!headers_end) {
+        if (buf->len > MAX_HEADERS_SIZE) return PARSE_ERROR;
+        return PARSE_INCOMPLETE;
+    }
+
+    req->headers_len = headers_end + 4 - buf->data;
+    req->id = next_request_id++;
+
+    return parse_request_headers(client);
 }
 
 void client_parse_request(client_t* client) {
     if (client->state != STATE_READING) return;
 
     parse_result_t r = try_parse_request(client);
+    LOG_CLIENT_DUMP(client, "parse result = %d", r);
 
     if (r == PARSE_INCOMPLETE) {
         if (client->peer_closed) {
@@ -702,8 +726,9 @@ void client_parse_request(client_t* client) {
     if (r == PARSE_NOT_SUPPORTED) return set_client_error(client, HTTP_405_NOT_ALLOWED);
 
     LOG_CLIENT_INFO(client,
-        "request: %s %s (body=%d)",
-        client->request.method, client->request.path, client->request.body_len);
+        "request: %s %s (headers=%d body=%d conn=%s)",
+        client->request.method, client->request.path,
+        client->request.headers_len, client->request.body_len, connection_str(client->request.connection));
 
     LOG_CLIENT_DUMP(client,
         "request:\n---\n"
@@ -726,16 +751,11 @@ int response_build(
     const char* content_type,
     const char* body,
     int body_len,
-    int connection_close
+    conn_t connection
 ) {
     int header_cap = 1024;
-
     int total_cap = header_cap + body_len;
-
-    res->buffer.data = malloc(total_cap);
-    if (!res->buffer.data) return 0;
-
-    const char* conn = connection_close ? "close" : "keep-alive";
+    if (!buffer_init(&res->buffer, total_cap)) return 0;
 
     int header_len = snprintf(
         res->buffer.data,
@@ -749,11 +769,11 @@ int response_build(
         status_text,
         content_type ? content_type : "application/octet-stream",
         body_len,
-        conn
+        connection_str(connection)
     );
 
     if (header_len < 0 || header_len >= header_cap) {
-        free(res->buffer.data);
+        buffer_free(&res->buffer);
         return 0;
     }
 
@@ -764,7 +784,7 @@ int response_build(
     res->buffer.len = header_len + body_len;
     res->sent = 0;
     res->status_code = status_code;
-    res->connection_close = connection_close;
+    res->connection = connection;
 
     return 1;
 }
@@ -809,7 +829,7 @@ void create_echo_response(client_t* client) {
         "text/plain",
         body,
         body_len,
-        client->request.connection_close
+        client->request.connection
     )) set_client_error(client, HTTP_500_INTERNAL_ERROR);
 }
 
@@ -996,7 +1016,7 @@ void create_fs_response(client_t* client, server_config_t* config) {
         mime,
         is_head_req ? NULL : file_data,
         file_len,
-        client->request.connection_close
+        client->request.connection
     )) set_client_error(client, HTTP_500_INTERNAL_ERROR);
 
     free(file_data);
@@ -1025,7 +1045,8 @@ void client_handle_request(client_t* client, server_config_t* config) {
 
     LOG_CLIENT_INFO(client,
         "response: %d (%d bytes, conn=%s)",
-        client->response.status_code, client->response.buffer.len, client->response.connection_close ? "close" : "keep-alive");
+        client->response.status_code, client->response.buffer.len, connection_str(client->response.connection));
+
     LOG_CLIENT_DUMP(client,
         "response:\n---\n"
         "%.*s"
@@ -1061,6 +1082,7 @@ void client_write_response(client_t* client) {
         LOG_CLIENT_DUMP(client, "wrote %zd bytes", n);
 
         if (n <= 0) {
+            LOG_CLIENT_PERROR_DUMP(client, "write");
             if (errno == EINTR) continue;
             else if (errno == EAGAIN || errno == EWOULDBLOCK) return;
             else if (errno == EPIPE) {
@@ -1078,6 +1100,7 @@ void client_write_response(client_t* client) {
     }
 
     set_client_state(client, STATE_DONE);
+    buffer_free(buf);
 }
 
 // ----------------------------------------------
@@ -1090,7 +1113,7 @@ void reset_client_for_next_request(client_t* client) {
     int remaining = req->buffer.len - req->headers_len - req->body_len;
     if (remaining < 0) remaining = 0;
 
-    // Shift buffer
+    // Shift request buffer
     if (remaining > 0) {
         memmove(
             req->buffer.data,
@@ -1101,45 +1124,170 @@ void reset_client_for_next_request(client_t* client) {
     req->buffer.len = remaining;
     req->buffer.data[req->buffer.len] = '\0';
 
-    // Reset parsing state
-    req->headers_done = 0;
+    // Reset request
     req->headers_len = 0;
     req->body_len = 0;
     req->id = 0;
     req->method[0] = '\0';
     req->path[0] = '\0';
     req->version[0] = '\0';
-    req->connection_close = 1;
 
     // Reset response
-    buffer_free(&client->response.buffer);
     memset(&client->response, 0, sizeof(response_t));
 
-    set_client_state(client, STATE_READING);
+    // Reset client
     client->error_code = 0;
-    client->peer_closed = 0;
     client->last_activity_ms = now_ms();
 }
 
 /**
  * if finished writing response and connection is still active,
- * reset client to prepare for the next request and try to parse request already in buffer
+ * reset client to prepare for the next request and try to
+ * parse request already in buffer (request pipelining)
  */
 void client_post_write(client_t* client) {
-    if (client->state != STATE_DONE || client->request.connection_close) return;
+    if (client->state != STATE_DONE || client->request.connection == CONN_CLOSE) return;
 
     LOG_CLIENT_DEBUG(client, "post-write reset for new request");
-
     reset_client_for_next_request(client);
 
-    client_parse_request(client); // request pipelining
+    if (client->peer_closed && client->request.buffer.len == 0) {
+        LOG_CLIENT_DEBUG(client, "peer closed, no more data");
+    }
+    else {
+        LOG_CLIENT_DEBUG(client, "moving to next request");
+        set_client_state(client, STATE_READING);
+        client_parse_request(client);
+    }
 }
 
 // ----------------------------------------------
 // Main loop
 // ----------------------------------------------
 
-void init_server_event_loop(server_config_t* config) {
+void accept_client_connection(int server_fd, pollfd_t* pfds, client_t* clients, int* nfds_ptr) {
+    int id = next_client_id++;
+    LOG_DEBUG("new connection c=>%d", id);
+
+    /**
+     * What accept() does
+     *  1. Takes one connection from the queue
+     *  2. Creates a new socket (client_fd)
+     *  3. Returns client address info (optional)
+     *
+     * Important behavior: Blocking call by default → waits until a client connects
+     */
+
+    struct sockaddr_in client_addr = { 0 };
+    socklen_t client_addr_len = sizeof(client_addr);
+    int client_fd = accept(
+        server_fd,
+        (struct sockaddr*)&client_addr,
+        &client_addr_len
+    );
+    if (client_fd < 0) {
+        if (errno != EINTR) LOG_PERROR("[c=%d] accept", id);
+        return; // don't kill server, go to next connection
+    }
+
+    if (set_nonblocking(client_fd) < 0) {
+        LOG_PERROR("[c=%d] fcntl failed", id);
+        close(client_fd);
+        return;
+    }
+
+    int nfds = *nfds_ptr;
+
+    if (nfds >= MAX_CLIENTS + 1) {
+        LOG_WARN("[c=%d] too many clients, dropping connection", id);
+        close(client_fd);
+        return;
+    }
+
+    pfds[nfds].fd = client_fd;
+
+    memset(&clients[nfds], 0, sizeof(client_t));
+    clients[nfds].id = id;
+    clients[nfds].state = STATE_READING;
+    clients[nfds].fd = client_fd;
+    clients[nfds].addr = client_addr;
+    clients[nfds].last_activity_ms = now_ms();
+    clients[nfds].peer_closed = 0;
+    clients[nfds].error_code = 0;
+
+    memset(&clients[nfds].request, 0, sizeof(request_t));
+    if (buffer_init(&clients[nfds].request.buffer, 4096) < 0) {
+        LOG_ERROR("[c=%d] failed to allocate request buffer", id);
+        close(client_fd);
+        return;
+    }
+    clients[nfds].request.connection = CONN_KEEP_ALIVE; // default HTTP/1.1 behavior
+    clients[nfds].request.headers_len = 0;
+
+    memset(&clients[nfds].response, 0, sizeof(response_t));
+
+    LOG_CLIENT_DEBUG(&clients[nfds], "connection accepted");
+
+    (*nfds_ptr)++;
+}
+
+client_res_t client_step(pollfd_t* pfds, client_t* clients, int i, server_config_t* config) {
+    client_t* client = &clients[i];
+    LOG_CLIENT_DEBUG(client, "client ready");
+
+    /**
+     * Client read/write ready
+     *
+     * After accept
+     *  - read from client_fd
+     *  - write to client_fd
+     *  - close client_fd when done
+     */
+
+    while (1) {
+        if (client->state == STATE_READING) {
+            if (!(pfds[i].revents & POLLIN)) break;
+            pfds[i].revents &= ~POLLIN; // consume event
+
+            LOG_CLIENT_DEBUG(client, "read ready");
+            int prev_buff_len = client->request.buffer.len;
+
+            client_read_request(client);
+            client_parse_request(client);
+
+            // read is blocked
+            if (client->state == STATE_READING && client->request.buffer.len == prev_buff_len) break;
+        }
+
+        else if (client->state == STATE_HANDLING) {
+            LOG_CLIENT_DEBUG(client, "handling");
+            client_handle_request(client, config);
+        }
+
+        else if (client->state == STATE_WRITING) {
+            LOG_CLIENT_DEBUG(client, "write ready");
+            int prev_sent = client->response.sent;
+
+            client_write_response(client);
+            client_post_write(client);
+
+            // write is blocked
+            if (client->state == STATE_WRITING && client->response.sent == prev_sent) break;
+        }
+
+        else break;
+    }
+
+    if (client->state == STATE_DONE || client->state == STATE_ERROR) {
+        if (client->state == STATE_DONE) LOG_CLIENT_DEBUG(client, "done");
+        else LOG_CLIENT_DEBUG(client, "error");
+        return CLIENT_RES_CLOSE;
+    }
+
+    return CLIENT_RES_KEEP;
+}
+
+void start_server(server_config_t* config) {
     setup_signal_handlers();
 
     int server_fd = setup_server();
@@ -1255,80 +1403,15 @@ void init_server_event_loop(server_config_t* config) {
             if (pfds[i].fd == server_fd) {
                 if (!(pfds[i].revents & POLLIN)) continue;
 
-                LOG_DEBUG("new connection c=>%d", next_client_id);
-
-                /**
-                 * What accept() does
-                 *  1. Takes one connection from the queue
-                 *  2. Creates a new socket (client_fd)
-                 *  3. Returns client address info (optional)
-                 *
-                 * Important behavior: Blocking call by default → waits until a client connects
-                 */
-                struct sockaddr_in client_addr = { 0 };
-                socklen_t client_addr_len = sizeof(client_addr);
-                int client_fd = accept(
-                    server_fd,
-                    (struct sockaddr*)&client_addr,
-                    &client_addr_len
-                );
-                if (client_fd < 0) {
-                    if (errno != EINTR) LOG_PERROR("[c=%d] accept", next_client_id);
-                    continue; // don't kill server, go to next connection
-                }
-
-                if (set_nonblocking(client_fd) < 0) {
-                    LOG_PERROR("[c=%d] fcntl failed", next_client_id);
-                    close(client_fd);
-                    continue;
-                }
-
-                if (nfds >= MAX_CLIENTS + 1) {
-                    LOG_WARN("[c=%d] too many clients, dropping connection", next_client_id);
-                    close(client_fd);
-                    continue;
-                }
-
-                pfds[nfds].fd = client_fd;
-
-                memset(&clients[nfds], 0, sizeof(client_t));
-                clients[nfds].id = next_client_id++;
-                clients[nfds].state = STATE_READING;
-                clients[nfds].fd = client_fd;
-                clients[nfds].addr = client_addr;
-                clients[nfds].last_activity_ms = now_ms();
-                clients[nfds].peer_closed = 0;
-                clients[nfds].error_code = 0;
-
-                memset(&clients[nfds].request, 0, sizeof(request_t));
-                if (buffer_init(&clients[nfds].request.buffer, 4096) < 0) {
-                    LOG_ERROR("[c=%d] failed to allocate request buffer", next_client_id);
-                    close(client_fd);
-                    continue;
-                }
-                clients[nfds].request.connection_close = 0; // default HTTP/1.1 behavior
-                clients[nfds].request.headers_done = 0;
-                clients[nfds].request.headers_len = 0;
-
-                memset(&clients[nfds].response, 0, sizeof(response_t));
-                if (buffer_init(&clients[nfds].response.buffer, 4096) < 0) {
-                    LOG_ERROR("[c=%d] failed to allocate response buffer", next_client_id);
-                    buffer_free(&clients[nfds].request.buffer);
-                    close(client_fd);
-                    continue;
-                }
-
-                LOG_CLIENT_DEBUG(&clients[nfds], "connection accepted");
-                nfds++;
+                accept_client_connection(server_fd, pfds, clients, &nfds);
                 continue;
             }
-
-            client_t* client = &clients[i];
 
             /**
              * Socket error
              */
             if (pfds[i].revents & (POLLERR | POLLNVAL)) {
+                client_t* client = &clients[i];
                 if (pfds[i].revents & POLLERR) LOG_CLIENT_ERROR(client, "socket error: POLLERR");
                 else LOG_CLIENT_ERROR(client, "socket error: POLLNVAL");
                 close_client(pfds, clients, &nfds, i);
@@ -1336,50 +1419,11 @@ void init_server_event_loop(server_config_t* config) {
                 continue;
             }
 
-            /**
-             * Client read/write ready
-             *
-             * After accept
-             *  - read from client_fd
-             *  - write to client_fd
-             *  - close client_fd when done
-             */
+            client_res_t res = client_step(pfds, clients, i, config);
 
-            LOG_CLIENT_DEBUG(client, "client ready");
-
-            while (1) {
-                if (client->state == STATE_READING) {
-                    if (!(pfds[i].revents & POLLIN)) break;
-                    pfds[i].revents &= ~POLLIN; // consume event
-
-                    LOG_CLIENT_DEBUG(client, "read ready");
-                    client_read_request(client);
-                    client_parse_request(client);
-                }
-
-                else if (client->state == STATE_HANDLING) {
-                    LOG_CLIENT_DEBUG(client, "handling");
-                    client_handle_request(client, config);
-                }
-
-                else if (client->state == STATE_WRITING) {
-                    LOG_CLIENT_DEBUG(client, "write ready");
-                    client_write_response(client);
-                    client_post_write(client);
-
-                    // write is blocked
-                    if (client->state == STATE_WRITING) break;
-                }
-
-                else break;
-            }
-
-            if (client->state == STATE_DONE || client->state == STATE_ERROR) {
-                if (client->state == STATE_DONE) LOG_CLIENT_DEBUG(client, "done");
-                else LOG_CLIENT_DEBUG(client, "error");
+            if (res == CLIENT_RES_CLOSE) {
                 close_client(pfds, clients, &nfds, i);
                 i--;
-                continue;
             }
         }
     }
@@ -1447,7 +1491,7 @@ int main(int argc, char** argv) {
 
     config.keep_alive_timeout_ms = 5000;
 
-    init_server_event_loop(&config);
+    start_server(&config);
 
     if (config.fs_root) free(config.fs_root);
 
