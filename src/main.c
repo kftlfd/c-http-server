@@ -110,6 +110,11 @@ typedef enum ParseResult {
     PARSE_NOT_SUPPORTED
 } parse_result_t;
 
+typedef enum Connection {
+    CONN_CLOSE,
+    CONN_KEEP_ALIVE
+} conn_t;
+
 typedef struct Buffer {
     char* data;
     int len;
@@ -120,15 +125,13 @@ typedef struct Request {
     int id;
     buffer_t buffer;
 
-    int headers_done;
-    int connection_close; // 1 = close, 0 = keep-alive
-
     int headers_len;
     int body_len;
 
     char method[8];
     char path[1024];
     char version[16];
+    conn_t connection;
 } request_t;
 
 typedef struct Response {
@@ -136,7 +139,7 @@ typedef struct Response {
     int sent;
 
     int status_code;
-    int connection_close; // 1 = close, 0 = keep-alive
+    conn_t connection;
 } response_t;
 
 typedef struct Client {
@@ -163,6 +166,32 @@ long now_ms() {
     return (ts.tv_sec * 1000L) + (ts.tv_nsec / 1000000L);
 }
 
+const char* state_str(client_state_t s) {
+    switch (s) {
+    case STATE_READING: return "READ";
+    case STATE_HANDLING: return "HANDL";
+    case STATE_WRITING: return "WRITE";
+    case STATE_DONE: return "DONE";
+    case STATE_ERROR: return "ERROR";
+    default: return "?";
+    }
+}
+
+const char* connection_str(conn_t conn) {
+    return conn == CONN_CLOSE ? "close" : "keep-alive";
+}
+
+const char* log_level_str(log_level_t level) {
+    switch (level) {
+    case LOG_L_DUMP: return "DUMP";
+    case LOG_L_DEBUG: return "DEBUG";
+    case LOG_L_INFO: return "INFO";
+    case LOG_L_WARN: return "WARN";
+    case LOG_L_ERROR: return "ERROR";
+    default: return "?";
+    }
+}
+
 // ----------------------------------------------
 // Logs
 // ----------------------------------------------
@@ -176,28 +205,6 @@ int parse_log_level(const char* s, log_level_t* out) {
     if (strcmp(s, "warn") == 0) { *out = LOG_L_WARN; return 1; }
     if (strcmp(s, "error") == 0) { *out = LOG_L_ERROR; return 1; }
     return 0;
-}
-
-const char* state_str(client_state_t s) {
-    switch (s) {
-    case STATE_READING: return "READ";
-    case STATE_HANDLING: return "HANDL";
-    case STATE_WRITING: return "WRITE";
-    case STATE_DONE: return "DONE";
-    case STATE_ERROR: return "ERROR";
-    default: return "?";
-    }
-}
-
-const char* log_level_str(log_level_t level) {
-    switch (level) {
-    case LOG_L_DUMP: return "DUMP";
-    case LOG_L_DEBUG: return "DEBUG";
-    case LOG_L_INFO: return "INFO";
-    case LOG_L_WARN: return "WARN";
-    case LOG_L_ERROR: return "ERROR";
-    default: return "?";
-    }
 }
 
 void get_ts_local(struct timespec* ts, char* out, int out_len) {
@@ -600,11 +607,9 @@ parse_result_t parse_request_headers(client_t* client) {
 
     *line_end = '\r';
 
+    client->request.connection = CONN_CLOSE;
     if (strcmp(client->request.version, "HTTP/1.1") == 0) {
-        client->request.connection_close = 0;
-    }
-    else {
-        client->request.connection_close = 1;
+        client->request.connection = CONN_KEEP_ALIVE;
     }
 
     /**
@@ -641,10 +646,10 @@ parse_result_t parse_request_headers(client_t* client) {
             }
             else if (strcasecmp(key, "connection") == 0) {
                 if (strcasecmp(value, "keep-alive") == 0) {
-                    client->request.connection_close = 0;
+                    client->request.connection = CONN_KEEP_ALIVE;
                 }
                 else if (strcasecmp(value, "close") == 0) {
-                    client->request.connection_close = 1;
+                    client->request.connection = CONN_CLOSE;
                 }
             }
             else if (strcasecmp(key, "transfer-encoding") == 0) {
@@ -663,25 +668,24 @@ parse_result_t try_parse_request(client_t* client) {
     request_t* req = &client->request;
     buffer_t* buf = &req->buffer;
 
-    if (!req->headers_done) {
-        char* headers_end = strstr(buf->data, "\r\n\r\n");
+    if (req->headers_len > 0) {
+        int body_received = buf->len - req->headers_len;
+        if (body_received < req->body_len) return PARSE_INCOMPLETE;
 
-        if (!headers_end) {
-            if (buf->len > MAX_HEADERS_SIZE) return PARSE_ERROR;
-            return PARSE_INCOMPLETE;
-        }
-
-        req->headers_done = 1;
-        req->headers_len = headers_end + 4 - buf->data;
-        req->id = next_request_id++;
-
-        return parse_request_headers(client);
+        return PARSE_OK;
     }
 
-    int body_received = buf->len - req->headers_len;
-    if (body_received < req->body_len) return PARSE_INCOMPLETE;
+    char* headers_end = strstr(buf->data, "\r\n\r\n");
 
-    return PARSE_OK;
+    if (!headers_end) {
+        if (buf->len > MAX_HEADERS_SIZE) return PARSE_ERROR;
+        return PARSE_INCOMPLETE;
+    }
+
+    req->headers_len = headers_end + 4 - buf->data;
+    req->id = next_request_id++;
+
+    return parse_request_headers(client);
 }
 
 void client_parse_request(client_t* client) {
@@ -702,8 +706,9 @@ void client_parse_request(client_t* client) {
     if (r == PARSE_NOT_SUPPORTED) return set_client_error(client, HTTP_405_NOT_ALLOWED);
 
     LOG_CLIENT_INFO(client,
-        "request: %s %s (body=%d)",
-        client->request.method, client->request.path, client->request.body_len);
+        "request: %s %s (headers=%d body=%d conn=%s)",
+        client->request.method, client->request.path,
+        client->request.headers_len, client->request.body_len, connection_str(client->request.connection));
 
     LOG_CLIENT_DUMP(client,
         "request:\n---\n"
@@ -726,16 +731,11 @@ int response_build(
     const char* content_type,
     const char* body,
     int body_len,
-    int connection_close
+    conn_t connection
 ) {
     int header_cap = 1024;
-
     int total_cap = header_cap + body_len;
-
-    res->buffer.data = malloc(total_cap);
-    if (!res->buffer.data) return 0;
-
-    const char* conn = connection_close ? "close" : "keep-alive";
+    if (!buffer_init(&res->buffer, total_cap)) return 0;
 
     int header_len = snprintf(
         res->buffer.data,
@@ -749,11 +749,11 @@ int response_build(
         status_text,
         content_type ? content_type : "application/octet-stream",
         body_len,
-        conn
+        connection_str(connection)
     );
 
     if (header_len < 0 || header_len >= header_cap) {
-        free(res->buffer.data);
+        buffer_free(&res->buffer);
         return 0;
     }
 
@@ -764,7 +764,7 @@ int response_build(
     res->buffer.len = header_len + body_len;
     res->sent = 0;
     res->status_code = status_code;
-    res->connection_close = connection_close;
+    res->connection = connection;
 
     return 1;
 }
@@ -809,7 +809,7 @@ void create_echo_response(client_t* client) {
         "text/plain",
         body,
         body_len,
-        client->request.connection_close
+        client->request.connection
     )) set_client_error(client, HTTP_500_INTERNAL_ERROR);
 }
 
@@ -996,7 +996,7 @@ void create_fs_response(client_t* client, server_config_t* config) {
         mime,
         is_head_req ? NULL : file_data,
         file_len,
-        client->request.connection_close
+        client->request.connection
     )) set_client_error(client, HTTP_500_INTERNAL_ERROR);
 
     free(file_data);
@@ -1025,7 +1025,8 @@ void client_handle_request(client_t* client, server_config_t* config) {
 
     LOG_CLIENT_INFO(client,
         "response: %d (%d bytes, conn=%s)",
-        client->response.status_code, client->response.buffer.len, client->response.connection_close ? "close" : "keep-alive");
+        client->response.status_code, client->response.buffer.len, connection_str(client->response.connection));
+
     LOG_CLIENT_DUMP(client,
         "response:\n---\n"
         "%.*s"
@@ -1102,14 +1103,13 @@ void reset_client_for_next_request(client_t* client) {
     req->buffer.data[req->buffer.len] = '\0';
 
     // Reset parsing state
-    req->headers_done = 0;
     req->headers_len = 0;
     req->body_len = 0;
     req->id = 0;
     req->method[0] = '\0';
     req->path[0] = '\0';
     req->version[0] = '\0';
-    req->connection_close = 1;
+    req->connection = CONN_KEEP_ALIVE;
 
     // Reset response
     buffer_free(&client->response.buffer);
@@ -1126,7 +1126,7 @@ void reset_client_for_next_request(client_t* client) {
  * reset client to prepare for the next request and try to parse request already in buffer
  */
 void client_post_write(client_t* client) {
-    if (client->state != STATE_DONE || client->request.connection_close) return;
+    if (client->state != STATE_DONE || client->request.connection == CONN_CLOSE) return;
 
     LOG_CLIENT_DEBUG(client, "post-write reset for new request");
 
@@ -1306,17 +1306,10 @@ void init_server_event_loop(server_config_t* config) {
                     close(client_fd);
                     continue;
                 }
-                clients[nfds].request.connection_close = 0; // default HTTP/1.1 behavior
-                clients[nfds].request.headers_done = 0;
+                clients[nfds].request.connection = CONN_KEEP_ALIVE; // default HTTP/1.1 behavior
                 clients[nfds].request.headers_len = 0;
 
                 memset(&clients[nfds].response, 0, sizeof(response_t));
-                if (buffer_init(&clients[nfds].response.buffer, 4096) < 0) {
-                    LOG_ERROR("[c=%d] failed to allocate response buffer", next_client_id);
-                    buffer_free(&clients[nfds].request.buffer);
-                    close(client_fd);
-                    continue;
-                }
 
                 LOG_CLIENT_DEBUG(&clients[nfds], "connection accepted");
                 nfds++;
