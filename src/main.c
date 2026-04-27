@@ -1,9 +1,9 @@
 /**
  * HTTP echo / static files server
- * - non-blocking I/O (poll-based event loop)
+ * - non-blocking I/O (poll-based event loop, process client until blocked)
  * - per-client state machine (read -> handle -> write)
  * - HTTP/1.1 keep-alive support
- * - basic request parsing (request line + headers)
+ * - basic request parsing (request line + some headers)
  * - static file serving (GET + HEAD)
  * - simple routing (/, .html fallback, index.html)
  * - connection timeouts
@@ -12,6 +12,7 @@
   * Limitations:
  * - only HTTP/1.1 (no HTTP/2, no TLS)
  * - only GET+HEAD supported in fs mode (no POST, etc.)
+ * - no "Host" header validation (HTTP/1.1 requirement)
  * - no "Transfer-Encoding: chunked"
  * - no request streaming (entire request buffered)
  * - no response streaming (entire file buffered in memory)
@@ -30,15 +31,20 @@
  * Security notes:
  * - prevents directory traversal ("..")
  * - restricts allowed path characters
- * - does not follow symlinks explicitly (depends on stat)
+ * - follows symlinks via `stat()` (not restricted)
  * - not hardened for production use
  *
  * TODO:
+ * - retry reading files until `size`
  * - sendfile() / streaming responses for large files
  * - LRU file cache
  * - more complete MIME type handling
  * - configuration (port, limits, timeouts)
  * - `writev() + `struct iovec` (`<sys/uio.h>`) for concurrency-safe logs
+ * - don't operate directly on `request.buffer` during parsing
+ * - split Request into `raw_request_t` (buffer + lengths) and `http_request_t` (method, path, headers)
+ * - split `create_fs_response` function
+ * - use `epoll`/`kqueue` instead of `poll`
  */
 
 #include <stdio.h>      // printf(), perror()
@@ -607,7 +613,7 @@ parse_result_t parse_request_headers(client_t* client) {
      * Parse request line
      */
     char* line_end = strstr(buf, "\r\n");
-    if (!line_end) return PARSE_ERROR;
+    if (!line_end) return PARSE_INCOMPLETE;
 
     *line_end = '\0';
 
@@ -1160,7 +1166,8 @@ void client_post_write(client_t* client) {
 // ----------------------------------------------
 
 void accept_client_connection(int server_fd, pollfd_t* pfds, client_t* clients, int* nfds_ptr) {
-    LOG_DEBUG("new connection c=>%d", next_client_id);
+    int id = next_client_id++;
+    LOG_DEBUG("new connection c=>%d", id);
 
     /**
      * What accept() does
@@ -1179,12 +1186,12 @@ void accept_client_connection(int server_fd, pollfd_t* pfds, client_t* clients, 
         &client_addr_len
     );
     if (client_fd < 0) {
-        if (errno != EINTR) LOG_PERROR("[c=%d] accept", next_client_id);
+        if (errno != EINTR) LOG_PERROR("[c=%d] accept", id);
         return; // don't kill server, go to next connection
     }
 
     if (set_nonblocking(client_fd) < 0) {
-        LOG_PERROR("[c=%d] fcntl failed", next_client_id);
+        LOG_PERROR("[c=%d] fcntl failed", id);
         close(client_fd);
         return;
     }
@@ -1192,7 +1199,7 @@ void accept_client_connection(int server_fd, pollfd_t* pfds, client_t* clients, 
     int nfds = *nfds_ptr;
 
     if (nfds >= MAX_CLIENTS + 1) {
-        LOG_WARN("[c=%d] too many clients, dropping connection", next_client_id);
+        LOG_WARN("[c=%d] too many clients, dropping connection", id);
         close(client_fd);
         return;
     }
@@ -1200,7 +1207,7 @@ void accept_client_connection(int server_fd, pollfd_t* pfds, client_t* clients, 
     pfds[nfds].fd = client_fd;
 
     memset(&clients[nfds], 0, sizeof(client_t));
-    clients[nfds].id = next_client_id++;
+    clients[nfds].id = id;
     clients[nfds].state = STATE_READING;
     clients[nfds].fd = client_fd;
     clients[nfds].addr = client_addr;
@@ -1210,7 +1217,7 @@ void accept_client_connection(int server_fd, pollfd_t* pfds, client_t* clients, 
 
     memset(&clients[nfds].request, 0, sizeof(request_t));
     if (buffer_init(&clients[nfds].request.buffer, 4096) < 0) {
-        LOG_ERROR("[c=%d] failed to allocate request buffer", next_client_id);
+        LOG_ERROR("[c=%d] failed to allocate request buffer", id);
         close(client_fd);
         return;
     }
