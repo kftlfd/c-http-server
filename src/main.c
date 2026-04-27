@@ -259,11 +259,13 @@ void log_msg(log_level_t level, const char* fmt, ...) {
 #define LOG_WARN(fmt, ...) log_msg(LOG_L_WARN, fmt, ##__VA_ARGS__)
 #define LOG_ERROR(fmt, ...) log_msg(LOG_L_ERROR, fmt, ##__VA_ARGS__)
 
-#define LOG_PERROR(fmt, ...) \
+#define LOG_PERROR_LEVEL(level, fmt, ...) \
     do { \
         int err = errno; \
-        log_msg(LOG_L_ERROR, fmt ": %s", ##__VA_ARGS__, strerror(err)); \
+        log_msg(level, fmt ": %s", ##__VA_ARGS__, strerror(err)); \
     } while (0)
+
+#define LOG_PERROR(fmt, ...) LOG_PERROR_LEVEL(LOG_L_ERROR, fmt, ##__VA_ARGS__)
 
 #define LOG_CLIENT(level, client, fmt, ...) \
     log_msg(level, "[c=%d fd=%d req=%d state=%s]\t" fmt, \
@@ -276,10 +278,13 @@ void log_msg(log_level_t level, const char* fmt, ...) {
 #define LOG_CLIENT_WARN(client, fmt, ...) LOG_CLIENT(LOG_L_WARN, client, fmt, ##__VA_ARGS__)
 #define LOG_CLIENT_ERROR(client, fmt, ...) LOG_CLIENT(LOG_L_ERROR, client, fmt, ##__VA_ARGS__)
 
-#define LOG_CLIENT_PERROR(client, fmt, ...) \
-    LOG_PERROR("[c=%d fd=%d req=%d state=%s]\t" fmt, \
+#define LOG_CLIENT_PERROR_LEVEL(level, client, fmt, ...) \
+    LOG_PERROR_LEVEL(level, "[c=%d fd=%d req=%d state=%s]\t" fmt, \
         (client)->id, (client)->fd, (client)->request.id, \
         state_str((client)->state), ##__VA_ARGS__)
+
+#define LOG_CLIENT_PERROR(client, fmt, ...) LOG_CLIENT_PERROR_LEVEL(LOG_L_ERROR, client, fmt, ##__VA_ARGS__)
+#define LOG_CLIENT_PERROR_DUMP(client, fmt, ...) LOG_CLIENT_PERROR_LEVEL(LOG_L_DUMP, client, fmt, ##__VA_ARGS__)
 
 // ----------------------------------------------
 // Buffer helpers
@@ -567,6 +572,7 @@ void client_read_request(client_t* client) {
         ssize_t n = read(client->fd, buf->data + buf->len, buf->cap - buf->len - 1);
 
         if (n < 0) {
+            LOG_CLIENT_PERROR_DUMP(client, "read");
             if (errno == EINTR) continue; // interrupted, can try read again immediately
             if (errno == EAGAIN || errno == EWOULDBLOCK) break; // read blocked, try in next poll iteration
 
@@ -576,9 +582,11 @@ void client_read_request(client_t* client) {
 
         if (n == 0) {
             client->peer_closed = 1;
+            LOG_CLIENT_DUMP(client, "read EOF => peer_closed=1");
             break;
         }
 
+        LOG_CLIENT_DUMP(client, "read %d bytes", n);
         buf->len += n;
         buf->data[buf->len] = '\0';
         client->last_activity_ms = now_ms();
@@ -697,6 +705,7 @@ void client_parse_request(client_t* client) {
     if (client->state != STATE_READING) return;
 
     parse_result_t r = try_parse_request(client);
+    LOG_CLIENT_DUMP(client, "parse result = %d", r);
 
     if (r == PARSE_INCOMPLETE) {
         if (client->peer_closed) {
@@ -1067,6 +1076,7 @@ void client_write_response(client_t* client) {
         LOG_CLIENT_DUMP(client, "wrote %zd bytes", n);
 
         if (n <= 0) {
+            LOG_CLIENT_PERROR_DUMP(client, "write");
             if (errno == EINTR) continue;
             else if (errno == EAGAIN || errno == EWOULDBLOCK) return;
             else if (errno == EPIPE) {
@@ -1084,6 +1094,7 @@ void client_write_response(client_t* client) {
     }
 
     set_client_state(client, STATE_DONE);
+    buffer_free(buf);
 }
 
 // ----------------------------------------------
@@ -1096,7 +1107,7 @@ void reset_client_for_next_request(client_t* client) {
     int remaining = req->buffer.len - req->headers_len - req->body_len;
     if (remaining < 0) remaining = 0;
 
-    // Shift buffer
+    // Shift request buffer
     if (remaining > 0) {
         memmove(
             req->buffer.data,
@@ -1107,36 +1118,41 @@ void reset_client_for_next_request(client_t* client) {
     req->buffer.len = remaining;
     req->buffer.data[req->buffer.len] = '\0';
 
-    // Reset parsing state
+    // Reset request
     req->headers_len = 0;
     req->body_len = 0;
     req->id = 0;
     req->method[0] = '\0';
     req->path[0] = '\0';
     req->version[0] = '\0';
-    req->connection = CONN_KEEP_ALIVE;
 
     // Reset response
-    buffer_free(&client->response.buffer);
     memset(&client->response, 0, sizeof(response_t));
 
-    set_client_state(client, STATE_READING);
+    // Reset client
     client->error_code = 0;
     client->last_activity_ms = now_ms();
 }
 
 /**
  * if finished writing response and connection is still active,
- * reset client to prepare for the next request and try to parse request already in buffer
+ * reset client to prepare for the next request and try to
+ * parse request already in buffer (request pipelining)
  */
 void client_post_write(client_t* client) {
     if (client->state != STATE_DONE || client->request.connection == CONN_CLOSE) return;
 
     LOG_CLIENT_DEBUG(client, "post-write reset for new request");
-
     reset_client_for_next_request(client);
 
-    client_parse_request(client); // request pipelining
+    if (client->peer_closed && client->request.buffer.len == 0) {
+        LOG_CLIENT_DEBUG(client, "peer closed, no more data");
+    }
+    else {
+        LOG_CLIENT_DEBUG(client, "moving to next request");
+        set_client_state(client, STATE_READING);
+        client_parse_request(client);
+    }
 }
 
 // ----------------------------------------------
@@ -1227,8 +1243,13 @@ client_res_t client_step(pollfd_t* pfds, client_t* clients, int i, server_config
             pfds[i].revents &= ~POLLIN; // consume event
 
             LOG_CLIENT_DEBUG(client, "read ready");
+            int prev_buff_len = client->request.buffer.len;
+
             client_read_request(client);
             client_parse_request(client);
+
+            // read is blocked
+            if (client->state == STATE_READING && client->request.buffer.len == prev_buff_len) break;
         }
 
         else if (client->state == STATE_HANDLING) {
@@ -1238,11 +1259,13 @@ client_res_t client_step(pollfd_t* pfds, client_t* clients, int i, server_config
 
         else if (client->state == STATE_WRITING) {
             LOG_CLIENT_DEBUG(client, "write ready");
+            int prev_sent = client->response.sent;
+
             client_write_response(client);
             client_post_write(client);
 
             // write is blocked
-            if (client->state == STATE_WRITING) break;
+            if (client->state == STATE_WRITING && client->response.sent == prev_sent) break;
         }
 
         else break;
