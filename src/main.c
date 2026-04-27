@@ -19,7 +19,7 @@
  * - limited MIME type detection
  * - no range requests (partial content)
  * - no directory listing
- * - no URL decoding (%20 etc.)
+ * - no URL decoding (%20 etc.), no query strings (?a=1)
  * - strict path validation (may reject some valid URLs)
  * - no concurrency beyond poll() (single-threaded)
  * - fixed limits:
@@ -44,13 +44,14 @@
 #include <stdio.h>      // printf(), perror()
 #include <stdlib.h>     // exit(), EXIT_FAILURE
 #include <string.h>     // memset()
+#include <strings.h>    // strcasecmp()
 #include <unistd.h>     // close()
-#include <arpa/inet.h>  // htons(), htonl(), sockaddr_in, INADDR_ANY
+#include <arpa/inet.h>  // htons(), htonl(), sockaddr_in, INADDR_ANY, inet_pton
 #include <sys/socket.h> // socket(), bind(), listen(), setsockopt()
 #include <signal.h>     // signal(), sigaction()
 #include <errno.h>      // EINTR
 #include <poll.h>       // poll()
-#include <limits.h>     // INT_MAX
+#include <limits.h>     // INT_MAX, PATH_MAX
 #include <fcntl.h>      // fcntl(), O_NONBLOCK
 #include <time.h>       // timespec, clock_gettime
 #include <sys/stat.h>   // stat()
@@ -102,23 +103,36 @@ typedef enum HttpStatus {
     HTTP_501_NOT_IMPLEMENTED = 501
 } http_status_t;
 
+typedef enum ParseResult {
+    PARSE_INCOMPLETE,
+    PARSE_OK,
+    PARSE_ERROR,
+    PARSE_NOT_SUPPORTED
+} parse_result_t;
+
+typedef struct Buffer {
+    char* data;
+    int len;
+    int cap;
+} buffer_t;
+
 typedef struct Request {
+    int id;
+    buffer_t buffer;
+
+    int headers_done;
+    int connection_close; // 1 = close, 0 = keep-alive
+
     int headers_len;
     int body_len;
 
     char method[8];
     char path[1024];
     char version[16];
-
-    int content_len;
-    int connection_close; // 1 = close, 0 = keep-alive
-
-    char* body;
 } request_t;
 
 typedef struct Response {
-    char* data;
-    int len;
+    buffer_t buffer;
     int sent;
 
     int status_code;
@@ -134,15 +148,7 @@ typedef struct Client {
     int peer_closed;
     http_status_t error_code;
 
-    char* buffer;
-    int buffer_len;
-    int buffer_cap;
-
-    int request_id;
     request_t request;
-    int headers_done;
-    int headers_len;
-
     response_t response;
 } client_t;
 
@@ -249,7 +255,7 @@ void log_msg(log_level_t level, const char* fmt, ...) {
 
 #define LOG_CLIENT(level, client, fmt, ...) \
     log_msg(level, "[c=%d fd=%d req=%d state=%s]\t" fmt, \
-        (client)->id, (client)->fd, (client)->request_id, \
+        (client)->id, (client)->fd, (client)->request.id, \
         state_str((client)->state), ##__VA_ARGS__)
 
 #define LOG_CLIENT_DUMP(client, fmt, ...) LOG_CLIENT(LOG_L_DUMP, client, fmt, ##__VA_ARGS__)
@@ -260,14 +266,51 @@ void log_msg(log_level_t level, const char* fmt, ...) {
 
 #define LOG_CLIENT_PERROR(client, fmt, ...) \
     LOG_PERROR("[c=%d fd=%d req=%d state=%s]\t" fmt, \
-        (client)->id, (client)->fd, (client)->request_id, \
+        (client)->id, (client)->fd, (client)->request.id, \
         state_str((client)->state), ##__VA_ARGS__)
+
+// ----------------------------------------------
+// Buffer helpers
+// ----------------------------------------------
+
+int buffer_init(buffer_t* buf, int size) {
+    memset(buf, 0, sizeof(buffer_t));
+    buf->data = malloc(size);
+    if (!buf->data) return -1;
+    buf->len = 0;
+    buf->cap = size;
+    return 1;
+}
+
+void buffer_free(buffer_t* buf) {
+    if (buf->data) free(buf->data);
+    memset(buf, 0, sizeof(buffer_t));
+}
+
+int buffer_reserve(buffer_t* buf, int needed) {
+    int new_cap = buf->cap;
+
+    while (new_cap < needed) {
+        if (new_cap >= INT_MAX / 2) return -1;
+        new_cap *= 2;
+    }
+
+    if (new_cap <= buf->cap) return 1;
+
+    char* tmp = realloc(buf->data, new_cap);
+
+    if (tmp == NULL) return -1;
+
+    buf->data = tmp;
+    buf->cap = new_cap;
+    return 1;
+}
 
 // ----------------------------------------------
 // Signal handlers
 // ----------------------------------------------
 
-/*
+/**
  * Global flag for graceful shutdown.
  *
  * volatile: prevents compiler from caching the value in a register,
@@ -277,7 +320,7 @@ void log_msg(log_level_t level, const char* fmt, ...) {
  */
 volatile sig_atomic_t keep_running = 1;
 
-/*
+/**
  * Signal handler for SIGINT and SIGTERM.
  *
  * When triggered, sets keep_running to 0 to signal the main
@@ -290,7 +333,7 @@ void signal_handler(int signum) {
 }
 
 void setup_signal_handlers() {
-    /*
+    /**
      * Set up signal handlers for graceful shutdown
      *
      * SIGINT:  Sent when user presses Ctrl+C
@@ -318,7 +361,7 @@ void setup_signal_handlers() {
         exit(EXIT_FAILURE);
     }
 
-    /*
+    /**
      * If client closes connection / crashed / reset the socket
      * during sending response with `write()` -> kernel may send SIGPIPE
      * by default it terminates the process immediately
@@ -338,8 +381,22 @@ void setup_signal_handlers() {
 // Server setup
 // ----------------------------------------------
 
+/**
+ * Set non-blocking mode for socket
+ */
+int set_nonblocking(int fd) {
+    /**
+     * Set non-blocking mode for socket
+     * fcntl = "file control", get/modify properties of file descriptor
+     * nonblock -> on read() and write()
+     */
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
 int setup_server() {
-    /*
+    /**
      * STEP 1: Create a socket
      *
      * socket(domain, type, protocol)
@@ -354,7 +411,12 @@ int setup_server() {
         exit(EXIT_FAILURE);
     }
 
-    /*
+    if (set_nonblocking(server_fd) < 0) {
+        LOG_PERROR("fcntl server_fd");
+        exit(EXIT_FAILURE);
+    }
+
+    /**
      * STEP 2: Set socket options
      *
      * setsockopt() allows configuration of socket behavior.
@@ -373,16 +435,24 @@ int setup_server() {
     struct sockaddr_in address;
     memset(&address, 0, sizeof(address));
 
-    /*
+    /**
      * htons() converts 16-bit values to network byte order.
      * htonl() converts 32-bit values to network byte order.
      */
-    address.sin_family = AF_INET;                       // IPv4
-    address.sin_port = htons(PORT);                     // Convert port to network byte order
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   // localhost => 127.0.0.1
-    // address.sin_addr.s_addr = htonl(INADDR_ANY);     // all available network interfaces => 0.0.0.0
+    address.sin_family = AF_INET; // IPv4
+    address.sin_port = htons(PORT);
 
-    /*
+    // all available network interfaces => 0.0.0.0
+    // address.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    // INADDR_LOOPBACK (localhost, 127.0.0.1) can cause portability issues
+    // address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) != 1) {
+        LOG_PERROR("inet_pton failed");
+        exit(EXIT_FAILURE);
+    }
+
+    /**
      * bind(socket, address, address_length)
      *
      * We cast sockaddr_in* to sockaddr* because the API is generic.
@@ -393,7 +463,7 @@ int setup_server() {
         exit(EXIT_FAILURE);
     }
 
-    /*
+    /**
      * STEP 4: Start listening for incoming connections
      *
      * listen(socket, backlog)
@@ -415,31 +485,16 @@ int setup_server() {
 // ----------------------------------------------
 
 /**
- * Set non-blocking mode for socket
- */
-int set_nonblocking(int fd) {
-    /**
-     * Set non-blocking mode for socket
-     * fcntl = "file control", get/modify properties of file descriptor
-     * nonblock -> on read() and write()
-     */
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags < 0) return -1;
-    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
-
-/**
  * Free allocated memory for client
  */
 void free_client(client_t* client) {
-    if (client->buffer != NULL) {
-        free(client->buffer);
-        client->buffer = NULL;
-        client->request.body = NULL;
+    if (client->request.buffer.data != NULL) {
+        buffer_free(&client->request.buffer);
+        memset(&client->request, 0, sizeof(request_t));
     }
-    if (client->response.data != NULL) {
-        free(client->response.data);
-        client->response.data = NULL;
+    if (client->response.buffer.data != NULL) {
+        buffer_free(&client->response.buffer);
+        memset(&client->response, 0, sizeof(response_t));
     }
 }
 
@@ -458,6 +513,11 @@ void close_client(pollfd_t* pfds, client_t* clients, int* nfds, int i) {
     (*nfds)--;
 }
 
+void set_client_state(client_t* client, client_state_t state) {
+    LOG_CLIENT_DEBUG(client, "state -> %s", state_str(state));
+    client->state = state;
+}
+
 void set_client_error(client_t* client, http_status_t status_code) {
     if (status_code < 100 || status_code > 599) {
         LOG_CLIENT_ERROR(client,
@@ -469,8 +529,7 @@ void set_client_error(client_t* client, http_status_t status_code) {
     client->error_code = status_code;
     LOG_CLIENT_ERROR(client, "set error: %d", status_code);
 
-    client->state = STATE_HANDLING;
-    LOG_CLIENT_DEBUG(client, "state -> HANDLING");
+    set_client_state(client, STATE_HANDLING);
 }
 
 // ----------------------------------------------
@@ -478,16 +537,57 @@ void set_client_error(client_t* client, http_status_t status_code) {
 // ----------------------------------------------
 
 /**
+ * Read request from client socket
+ * handles partial reads and interrupts
+ */
+void client_read_request(client_t* client) {
+    request_t* req = &client->request;
+    buffer_t* buf = &req->buffer;
+
+    while (1) {
+        // ensure buffer has space for at least 1 more byte
+        if (buf->len + 1 >= buf->cap) {
+            if (buf->cap > MAX_REQUEST_SIZE / 2) return set_client_error(client, HTTP_400_BAD_REQUEST);
+            if (buffer_reserve(buf, buf->len + 1) < 0) return set_client_error(client, HTTP_500_INTERNAL_ERROR);
+        }
+
+        // read remaining capacity - 1 (reserve for '\0')
+        ssize_t n = read(client->fd, buf->data + buf->len, buf->cap - buf->len - 1);
+
+        if (n < 0) {
+            if (errno == EINTR) continue; // interrupted, can try read again immediately
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break; // read blocked, try in next poll iteration
+
+            LOG_CLIENT_PERROR(client, "read");
+            return set_client_error(client, HTTP_400_BAD_REQUEST);
+        }
+
+        if (n == 0) {
+            client->peer_closed = 1;
+            break;
+        }
+
+        buf->len += n;
+        buf->data[buf->len] = '\0';
+        client->last_activity_ms = now_ms();
+    }
+}
+
+// ----------------------------------------------
+// Parse request
+// ----------------------------------------------
+
+/**
  * Parse request line, headers, populate `client->request`
  */
-int parse_request_headers(client_t* client) {
-    char* buf = client->buffer;
+parse_result_t parse_request_headers(client_t* client) {
+    char* buf = client->request.buffer.data;
 
     /**
      * Parse request line
      */
     char* line_end = strstr(buf, "\r\n");
-    if (!line_end) return 0;
+    if (!line_end) return PARSE_ERROR;
 
     *line_end = '\0';
 
@@ -496,7 +596,7 @@ int parse_request_headers(client_t* client) {
         client->request.method,
         client->request.path,
         client->request.version
-    ) != 3) return 0;
+    ) != 3) return PARSE_ERROR;
 
     *line_end = '\r';
 
@@ -511,20 +611,20 @@ int parse_request_headers(client_t* client) {
      * Parse headers
      */
     char* p = line_end + 2;
-    char* headers_end = client->buffer + client->headers_len;
+    char* headers_end = client->request.buffer.data + client->request.headers_len;
 
-    client->request.content_len = 0;
+    client->request.body_len = 0;
 
     int headers_count = 0;
 
     while (p < headers_end - 2) {
         char* next = strstr(p, "\r\n");
-        if (!next) return 0;
+        if (!next) return PARSE_ERROR;
 
         if (next == p) break; // empty line
 
         headers_count++;
-        if (headers_count > MAX_HEADERS_COUNT) return 0;
+        if (headers_count > MAX_HEADERS_COUNT) return PARSE_ERROR;
 
         *next = '\0';
 
@@ -536,8 +636,8 @@ int parse_request_headers(client_t* client) {
             if (strcasecmp(key, "content-length") == 0) {
                 char* end;
                 long len = strtol(value, &end, 10);
-                if (*end != '\0' || len < 0 || len > MAX_REQUEST_SIZE) return 0;
-                client->request.content_len = (int)len;
+                if (*end != '\0' || len < 0 || len > MAX_REQUEST_SIZE) return PARSE_ERROR;
+                client->request.body_len = (int)len;
             }
             else if (strcasecmp(key, "connection") == 0) {
                 if (strcasecmp(value, "keep-alive") == 0) {
@@ -548,7 +648,7 @@ int parse_request_headers(client_t* client) {
                 }
             }
             else if (strcasecmp(key, "transfer-encoding") == 0) {
-                return -1; // not supported
+                return PARSE_NOT_SUPPORTED; // not supported
             }
         }
 
@@ -556,191 +656,63 @@ int parse_request_headers(client_t* client) {
         p = next + 2;
     }
 
-    client->request.body_len = client->request.content_len;
-
-    return 1;
+    return PARSE_OK;
 }
 
-void reset_client_for_next_request(client_t* client) {
-    int remaining = client->buffer_len - client->request.headers_len - client->request.content_len;
-    if (remaining < 0) remaining = 0;
+parse_result_t try_parse_request(client_t* client) {
+    request_t* req = &client->request;
+    buffer_t* buf = &req->buffer;
 
-    // Shift buffer
-    if (remaining > 0) {
-        memmove(
-            client->buffer,
-            client->request.body + client->request.content_len,
-            remaining
-        );
-    }
-    client->buffer_len = remaining;
-    client->buffer[client->buffer_len] = '\0';
+    if (!req->headers_done) {
+        char* headers_end = strstr(buf->data, "\r\n\r\n");
 
-    // Reset parsing state
-    client->headers_done = 0;
-    client->headers_len = 0;
+        if (!headers_end) {
+            if (buf->len > MAX_HEADERS_SIZE) return PARSE_ERROR;
+            return PARSE_INCOMPLETE;
+        }
 
-    memset(&client->request, 0, sizeof(request_t));
-    client->request.connection_close = 1;
+        req->headers_done = 1;
+        req->headers_len = headers_end + 4 - buf->data;
+        req->id = next_request_id++;
 
-    // Reset response
-    if (client->response.data) {
-        free(client->response.data);
-        client->response.data = NULL;
+        return parse_request_headers(client);
     }
 
-    memset(&client->response, 0, sizeof(response_t));
+    int body_received = buf->len - req->headers_len;
+    if (body_received < req->body_len) return PARSE_INCOMPLETE;
 
-    client->last_activity_ms = now_ms();
-    client->state = STATE_READING;
-    LOG_CLIENT_DEBUG(client, "state -> READING");
-    client->error_code = 0;
+    return PARSE_OK;
 }
 
-/**
- * Read request from client socket
- * handles partial reads and interrupts
- */
-void handle_read(client_t* client) {
-    while (1) {
-        /**
-         * grow buffer if needed
-         */
-        if (client->buffer_len + 1 >= client->buffer_cap) {
-            if (client->buffer_cap > MAX_REQUEST_SIZE / 2) return set_client_error(client, HTTP_400_BAD_REQUEST);
-            client->buffer_cap *= 2;
-            int body_offset = -1;
-            if (client->request.body != NULL) body_offset = client->request.body - client->buffer;
-            char* tmp = realloc(client->buffer, client->buffer_cap);
-            if (tmp == NULL) return set_client_error(client, HTTP_500_INTERNAL_ERROR);
-            client->buffer = tmp;
-            if (body_offset >= 0) client->request.body = client->buffer + body_offset;
-        }
+void client_parse_request(client_t* client) {
+    if (client->state != STATE_READING) return;
 
-        /**
-         * read next bytes, handle errors
-         */
-        char* write_pos = client->buffer + client->buffer_len;
-        size_t read_bytes = client->buffer_cap - client->buffer_len - 1; // room left in buffer
+    parse_result_t r = try_parse_request(client);
 
-        // cap read to expected content len
-        if (client->headers_done && client->request.content_len > 0) {
-            // end of expected request = body start + declared content length
-            char* want_end = client->request.body + client->request.content_len;
-
-            if (want_end > write_pos) {
-                size_t remaining = want_end - write_pos;
-                if (remaining < 0) remaining = 0;
-                if (remaining < read_bytes) read_bytes = remaining;
-            }
-            else {
-                // already have everything; shouldn't normally reach here because
-                // the previous iteration's check would have goto'd next_step,
-                // but just in case.
-                goto next_step;
-            }
-        }
-
-        if (read_bytes == 0) {
-            if (client->headers_done) goto next_step;
-            else return set_client_error(client, HTTP_400_BAD_REQUEST);
-        }
-
-        ssize_t n = read(client->fd, write_pos, read_bytes);
-        LOG_CLIENT_DUMP(client, "read %zd bytes", n);
-
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // If peer already closed, no more data will come
-                if (client->peer_closed) return set_client_error(client, HTTP_400_BAD_REQUEST);
-                break;
-            }
-            else {
-                LOG_CLIENT_PERROR(client, "read");
-                set_client_error(client, HTTP_400_BAD_REQUEST);
-            }
-        }
-
-        /**
-         * EOF
-         */
-        if (n == 0) {
-            client->peer_closed = 1;
-            LOG_CLIENT_INFO(client, "peer closed connection");
-
-            // Case 1: no new request started -> clean close
-            if (!client->headers_done && client->buffer_len == 0) {
-                client->state = STATE_DONE;
-                LOG_CLIENT_DEBUG(client, "state -> DONE");
-                return;
-            }
-
-            // Case 2: partial request -> error
-            if (!client->headers_done) return set_client_error(client, HTTP_400_BAD_REQUEST);
-
-            // Case 3: headers done, check body
-            // If no body expected OR already fully read -> OK
-            int body_received = 0;
-            if (client->request.body) {
-                body_received = (client->buffer + client->buffer_len) - client->request.body;
-            }
-            if (body_received >= client->request.content_len) goto next_step;
-
-            return set_client_error(client, HTTP_400_BAD_REQUEST);
-        };
-
-        client->buffer_len += n;
-        client->buffer[client->buffer_len] = '\0';
-        client->last_activity_ms = now_ms();
-
-        if (!client->headers_done && client->buffer_len > MAX_HEADERS_SIZE) {
-            LOG_CLIENT_ERROR(client, "headers too large");
+    if (r == PARSE_INCOMPLETE) {
+        if (client->peer_closed) {
+            if (client->request.buffer.len < 1) return set_client_state(client, STATE_DONE);
             return set_client_error(client, HTTP_400_BAD_REQUEST);
         }
+        return;
+    };
 
-        // check for headers end
-        if (!client->headers_done) {
-            char* headers_end = strstr(client->buffer, "\r\n\r\n");
-            if (headers_end != NULL) {
-                client->headers_done = 1;
-                client->request_id = next_request_id++;
+    if (r == PARSE_ERROR) return set_client_error(client, HTTP_400_BAD_REQUEST);
 
-                int headers_len = headers_end - client->buffer + 4;
-                client->headers_len = headers_len;
+    if (r == PARSE_NOT_SUPPORTED) return set_client_error(client, HTTP_405_NOT_ALLOWED);
 
-                client->request.headers_len = headers_len;
-                client->request.body = headers_end + 4;
-
-                int ok = parse_request_headers(client);
-                if (ok < 0) return set_client_error(client, HTTP_405_NOT_ALLOWED);
-                if (ok < 1) return set_client_error(client, HTTP_400_BAD_REQUEST);
-            }
-        }
-
-        if (client->headers_done) {
-            int body_received = (client->buffer + client->buffer_len) - client->request.body;
-
-            if (body_received >= client->request.content_len) goto next_step;
-        }
-    }
-    return;
-
-next_step: {
     LOG_CLIENT_INFO(client,
         "request: %s %s (body=%d)",
-        client->request.method, client->request.path, client->request.content_len);
+        client->request.method, client->request.path, client->request.body_len);
+
     LOG_CLIENT_DUMP(client,
         "request:\n---\n"
         "%.*s"
         "\n---",
-        client->request.headers_len + client->request.body_len, client->buffer
+        client->request.headers_len + client->request.body_len, client->request.buffer.data
     );
 
-    client->state = STATE_HANDLING;
-    LOG_CLIENT_DEBUG(client, "state -> HANDLING");
-    return;
-    }
+    set_client_state(client, STATE_HANDLING);
 }
 
 // ----------------------------------------------
@@ -760,13 +732,13 @@ int response_build(
 
     int total_cap = header_cap + body_len;
 
-    res->data = malloc(total_cap);
-    if (!res->data) return 0;
+    res->buffer.data = malloc(total_cap);
+    if (!res->buffer.data) return 0;
 
     const char* conn = connection_close ? "close" : "keep-alive";
 
     int header_len = snprintf(
-        res->data,
+        res->buffer.data,
         header_cap,
         "HTTP/1.1 %d %s\r\n"
         "Content-Type: %s\r\n"
@@ -781,15 +753,15 @@ int response_build(
     );
 
     if (header_len < 0 || header_len >= header_cap) {
-        free(res->data);
+        free(res->buffer.data);
         return 0;
     }
 
     if (body_len > 0 && body != NULL) {
-        memcpy(res->data + header_len, body, body_len);
+        memcpy(res->buffer.data + header_len, body, body_len);
     }
 
-    res->len = header_len + body_len;
+    res->buffer.len = header_len + body_len;
     res->sent = 0;
     res->status_code = status_code;
     res->connection_close = connection_close;
@@ -825,8 +797,8 @@ int create_error_response(client_t* client, http_status_t code) {
 // ----------------------------------------------
 
 void create_echo_response(client_t* client) {
-    int body_len = client->request.content_len;
-    const char* body = client->request.body;
+    int body_len = client->request.body_len;
+    const char* body = client->request.buffer.data + client->request.headers_len;
 
     if (!body) body_len = 0;
 
@@ -888,7 +860,7 @@ int resolve_path(char* out, size_t cap, server_config_t* config, const char* url
         if (n < 0 || (size_t)n >= sizeof(path)) return 0;
 
         if (file_exists(path, &is_dir) && !is_dir) {
-            int n = snprintf(out, cap, "%s", path);
+            n = snprintf(out, cap, "%s", path);
             if (n < 0 || (size_t)n >= cap) return 0;
             return 1;
         }
@@ -1035,7 +1007,7 @@ void create_fs_response(client_t* client, server_config_t* config) {
 // Handle request
 // ----------------------------------------------
 
-void handle_request(client_t* client, server_config_t* config) {
+void client_handle_request(client_t* client, server_config_t* config) {
     if (client->error_code == 0) {
         if (config->mode == MODE_ECHO) {
             create_echo_response(client);
@@ -1047,24 +1019,21 @@ void handle_request(client_t* client, server_config_t* config) {
 
     if (client->error_code != 0) {
         if (!create_error_response(client, client->error_code)) {
-            client->state = STATE_ERROR;
-            LOG_CLIENT_DEBUG(client, "state -> ERROR");
-            return;
+            return set_client_state(client, STATE_ERROR);
         }
     }
 
-    client->state = STATE_WRITING;
-    LOG_CLIENT_DEBUG(client, "state -> WRITING");
-
     LOG_CLIENT_INFO(client,
         "response: %d (%d bytes, conn=%s)",
-        client->response.status_code, client->response.len, client->response.connection_close ? "close" : "keep-alive");
+        client->response.status_code, client->response.buffer.len, client->response.connection_close ? "close" : "keep-alive");
     LOG_CLIENT_DUMP(client,
         "response:\n---\n"
         "%.*s"
         "\n---",
-        client->response.len, client->response.data
+        client->response.buffer.len, client->response.buffer.data
     );
+
+    set_client_state(client, STATE_WRITING);
 }
 
 // ----------------------------------------------
@@ -1075,17 +1044,18 @@ void handle_request(client_t* client, server_config_t* config) {
  * Write response to client socket
  * handles partial writes and interrupts
  */
-void handle_write(client_t* client) {
+void client_write_response(client_t* client) {
     response_t* res = &client->response;
+    buffer_t* buf = &res->buffer;
 
-    while (res->sent < res->len) {
-        LOG_CLIENT_DUMP(client, "write progress: %d/%d bytes", res->sent, res->len);
+    while (res->sent < buf->len) {
+        LOG_CLIENT_DUMP(client, "write progress: %d/%d bytes", res->sent, buf->len);
 
         // write next bytes
         ssize_t n = write(
             client->fd,
-            res->data + res->sent,
-            res->len - res->sent
+            buf->data + res->sent,
+            buf->len - res->sent
         );
 
         LOG_CLIENT_DUMP(client, "wrote %zd bytes", n);
@@ -1093,11 +1063,13 @@ void handle_write(client_t* client) {
         if (n <= 0) {
             if (errno == EINTR) continue;
             else if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+            else if (errno == EPIPE) {
+                LOG_CLIENT_DEBUG(client, "write errno EPIPE");
+                return set_client_state(client, STATE_DONE);
+            }
             else {
                 LOG_CLIENT_PERROR(client, "write");
-                client->state = STATE_ERROR;
-                LOG_CLIENT_DEBUG(client, "state -> ERROR");
-                return;
+                return set_client_state(client, STATE_ERROR);
             }
         }
 
@@ -1105,13 +1077,62 @@ void handle_write(client_t* client) {
         client->last_activity_ms = now_ms();
     }
 
-    if (res->connection_close || client->peer_closed) {
-        client->state = STATE_DONE;
-        LOG_CLIENT_DEBUG(client, "state -> DONE");
+    set_client_state(client, STATE_DONE);
+}
+
+// ----------------------------------------------
+// Post-write
+// ----------------------------------------------
+
+void reset_client_for_next_request(client_t* client) {
+    request_t* req = &client->request;
+
+    int remaining = req->buffer.len - req->headers_len - req->body_len;
+    if (remaining < 0) remaining = 0;
+
+    // Shift buffer
+    if (remaining > 0) {
+        memmove(
+            req->buffer.data,
+            req->buffer.data + req->headers_len + req->body_len,
+            remaining
+        );
     }
-    else {
-        reset_client_for_next_request(client);
-    }
+    req->buffer.len = remaining;
+    req->buffer.data[req->buffer.len] = '\0';
+
+    // Reset parsing state
+    req->headers_done = 0;
+    req->headers_len = 0;
+    req->body_len = 0;
+    req->id = 0;
+    req->method[0] = '\0';
+    req->path[0] = '\0';
+    req->version[0] = '\0';
+    req->connection_close = 1;
+
+    // Reset response
+    buffer_free(&client->response.buffer);
+    memset(&client->response, 0, sizeof(response_t));
+
+    set_client_state(client, STATE_READING);
+    client->error_code = 0;
+    client->peer_closed = 0;
+    client->last_activity_ms = now_ms();
+}
+
+/**
+ * if finished writing response and connection is still active,
+ * reset client to prepare for the next request and try to parse request already in buffer
+ */
+void client_post_write(client_t* client) {
+    if (client->state != STATE_DONE || client->request.connection_close) return;
+
+    LOG_CLIENT_DEBUG(client, "post-write reset for new request");
+
+    reset_client_for_next_request(client);
+
+    client_parse_request(client); // request pipelining
 }
 
 // ----------------------------------------------
@@ -1268,18 +1289,9 @@ void init_server_event_loop(server_config_t* config) {
                     continue;
                 }
 
-                int buffer_cap = 4096;
-                char* buffer = malloc(sizeof(char) * buffer_cap);
-                if (buffer == NULL) {
-                    LOG_ERROR("[c=%d] failed to allocate request buffer", next_client_id);
-                    close(client_fd);
-                    continue;
-                }
-
                 pfds[nfds].fd = client_fd;
 
                 memset(&clients[nfds], 0, sizeof(client_t));
-
                 clients[nfds].id = next_client_id++;
                 clients[nfds].state = STATE_READING;
                 clients[nfds].fd = client_fd;
@@ -1288,22 +1300,26 @@ void init_server_event_loop(server_config_t* config) {
                 clients[nfds].peer_closed = 0;
                 clients[nfds].error_code = 0;
 
-                clients[nfds].buffer = buffer;
-                clients[nfds].buffer_len = 0;
-                clients[nfds].buffer_cap = buffer_cap;
-
                 memset(&clients[nfds].request, 0, sizeof(request_t));
+                if (buffer_init(&clients[nfds].request.buffer, 4096) < 0) {
+                    LOG_ERROR("[c=%d] failed to allocate request buffer", next_client_id);
+                    close(client_fd);
+                    continue;
+                }
                 clients[nfds].request.connection_close = 0; // default HTTP/1.1 behavior
-
-                clients[nfds].headers_done = 0;
-                clients[nfds].headers_len = 0;
+                clients[nfds].request.headers_done = 0;
+                clients[nfds].request.headers_len = 0;
 
                 memset(&clients[nfds].response, 0, sizeof(response_t));
+                if (buffer_init(&clients[nfds].response.buffer, 4096) < 0) {
+                    LOG_ERROR("[c=%d] failed to allocate response buffer", next_client_id);
+                    buffer_free(&clients[nfds].request.buffer);
+                    close(client_fd);
+                    continue;
+                }
 
                 LOG_CLIENT_DEBUG(&clients[nfds], "connection accepted");
-
                 nfds++;
-
                 continue;
             }
 
@@ -1331,42 +1347,36 @@ void init_server_event_loop(server_config_t* config) {
 
             LOG_CLIENT_DEBUG(client, "client ready");
 
-            if (client->state == STATE_READING && (pfds[i].revents & POLLIN)) {
-                LOG_CLIENT_DEBUG(client, "read ready");
-                handle_read(client);
-            }
+            while (1) {
+                if (client->state == STATE_READING) {
+                    if (!(pfds[i].revents & POLLIN)) break;
+                    pfds[i].revents &= ~POLLIN; // consume event
 
-            if (client->state == STATE_HANDLING) {
-                LOG_CLIENT_DEBUG(client, "handling");
-                handle_request(client, config);
-            }
+                    LOG_CLIENT_DEBUG(client, "read ready");
+                    client_read_request(client);
+                    client_parse_request(client);
+                }
 
-            if (client->state == STATE_WRITING && (pfds[i].revents & POLLOUT)) {
-                LOG_CLIENT_DEBUG(client, "write ready");
-                handle_write(client);
-            }
+                else if (client->state == STATE_HANDLING) {
+                    LOG_CLIENT_DEBUG(client, "handling");
+                    client_handle_request(client, config);
+                }
 
-            if (client->state == STATE_READING && client->buffer_len > 0 && !client->peer_closed) {
-                // try to parse next request immediately (pipeline)
-                LOG_CLIENT_DEBUG(client, "pipeline read");
-                handle_read(client);
-            }
+                else if (client->state == STATE_WRITING) {
+                    LOG_CLIENT_DEBUG(client, "write ready");
+                    client_write_response(client);
+                    client_post_write(client);
 
-            if (client->state == STATE_READING && client->peer_closed && !(pfds[i].revents & POLLIN)) {
-                // no more data will come
-                LOG_CLIENT_DEBUG(client, "peer closed without full request");
-                close_client(pfds, clients, &nfds, i);
-                i--;
-                continue;
+                    // write is blocked
+                    if (client->state == STATE_WRITING) break;
+                }
+
+                else break;
             }
 
             if (client->state == STATE_DONE || client->state == STATE_ERROR) {
-                if (client->state == STATE_DONE) {
-                    LOG_CLIENT_DEBUG(client, "done");
-                }
-                else {
-                    LOG_CLIENT_DEBUG(client, "error");
-                }
+                if (client->state == STATE_DONE) LOG_CLIENT_DEBUG(client, "done");
+                else LOG_CLIENT_DEBUG(client, "error");
                 close_client(pfds, clients, &nfds, i);
                 i--;
                 continue;
@@ -1438,5 +1448,8 @@ int main(int argc, char** argv) {
     config.keep_alive_timeout_ms = 5000;
 
     init_server_event_loop(&config);
+
+    if (config.fs_root) free(config.fs_root);
+
     return 0;
 }

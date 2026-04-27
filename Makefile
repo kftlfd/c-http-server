@@ -2,7 +2,7 @@ SRC = src/main.c
 
 TARGET = server
 
-CFLAGS = -Wall -Wextra -std=c11
+CFLAGS = -D_POSIX_C_SOURCE=200809L -Wall -Wextra -std=c11
 
 build:
 	gcc $(CFLAGS) $(SRC) -o $(TARGET)
