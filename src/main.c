@@ -1122,7 +1122,6 @@ void reset_client_for_next_request(client_t* client) {
 
     set_client_state(client, STATE_READING);
     client->error_code = 0;
-    client->peer_closed = 0;
     client->last_activity_ms = now_ms();
 }
 
