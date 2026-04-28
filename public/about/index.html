@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <title>C HTTP Server</title>
+
+    <link rel="stylesheet" href="/styles.css" />
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/github-markdown-css/github-markdown.min.css"
+    />
+
+    <style>
+      :root {
+        --warn-bg: #1f1a0e;
+        --warn-border: #3b2f14;
+        --warn-text: #f2cc60;
+      }
+
+      .warning {
+        background: var(--warn-bg);
+        border: 1px solid var(--warn-border);
+        color: var(--warn-text);
+        padding: 12px 16px;
+        border-radius: 8px;
+        margin: 16px 0;
+        font-size: 14px;
+      }
+
+      .markdown-body {
+        width: 100vw;
+        max-width: 900px;
+      }
+    </style>
+  </head>
+
+  <body>
+    <main class="container">
+      <div class="card warning">
+        <strong> Warning: mostly AI generated</strong> (but still fine, I'm too
+        lazy to write it myself)
+      </div>
+
+      <article id="content" class="card markdown-body">Loading...</article>
+    </main>
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+
+    <script>
+      const contentEl = document.getElementById("content");
+      if (!contentEl) throw new Error("content element not found");
+
+      async function loadMarkdown() {
+        const res = await fetch("/about/about.md");
+        if (!res.ok) throw new Error("fetch error");
+        const md = await res.text();
+        return marked.parse(md);
+      }
+
+      loadMarkdown().then(
+        (md) => {
+          contentEl.innerHTML = md;
+        },
+        (err) => {
+          console.error(err);
+          contentEl.innerHTML = `
+            <h1>Error</h1>
+            <p>Failed to load or parse, idk, look in the console.</p>
+          `;
+        }
+      );
+    </script>
+  </body>
+</html>

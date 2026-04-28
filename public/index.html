@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <title>C HTTP Server</title>
+
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+
+  <body>
+    <main class="container container-sm align-center">
+      <div class="card hero">
+        <h1>Minimal HTTP Server in C</h1>
+
+        <p>
+          A small experimental HTTP server written in pure C, built to explore
+          how HTTP servers actually work + get some practice with C.
+        </p>
+
+        <ul class="features">
+          <li>Non-blocking I/O with <code>poll()</code></li>
+          <li>Per-client state machine</li>
+          <li>HTTP/1.1 keep-alive</li>
+          <li>Basic request parsing</li>
+          <li>Static file serving (GET / HEAD)</li>
+        </ul>
+
+        <p>
+          It’s intentionally minimal, has lots of limitations, and not
+          production-ready.
+        </p>
+
+        <a href="/about" class="button">Read more</a>
+
+        <div class="footer">
+          Built as a learning project · No frameworks · No dependencies
+        </div>
+      </div>
+    </main>
+  </body>
+</html>
