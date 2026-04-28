@@ -56,10 +56,13 @@ $ make all
 
 ```bash
 # echo
-$ ./server echo
+$ ./server [echo]
 
 # serve static files
 $ ./server fs <path>
+
+# see all options with
+$ ./server --help
 ```
 
 # TODO:
@@ -68,7 +71,7 @@ $ ./server fs <path>
 - sendfile() / streaming responses for large files
 - LRU file cache
 - more complete MIME type handling
-- configuration (port, limits, timeouts)
+- configuration (limits, timeouts)
 - `writev() + `struct iovec` (`<sys/uio.h>`) for concurrency-safe logs
 - don't operate directly on `request.buffer` during parsing
 - split Request into `raw_request_t` (buffer + lengths) and `http_request_t` (method, path, headers)
