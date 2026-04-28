@@ -1,6 +1,5 @@
 TARGET = server
 BUILD_DIR = build
-INCLUDE_DIR = include
 
 SRC = \
 	src/main.c \
@@ -19,9 +18,8 @@ F_POSIX		= -D_POSIX_C_SOURCE=200809L	# for portability
 F_WARNINGS	= -Wall -Wextra
 F_C_STD		= -std=c11
 F_DEPS		= -MMD -MP # auto-generate .d files
-F_INCLUDE	= -I$(INCLUDE_DIR) # add include directory
 
-CFLAGS = $(F_C_STD) $(F_POSIX) $(F_WARNINGS) $(F_DEPS) $(F_INCLUDE)
+CFLAGS = $(F_C_STD) $(F_POSIX) $(F_WARNINGS) $(F_DEPS)
 
 # default target
 all: $(TARGET)
