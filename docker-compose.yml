@@ -1,0 +1,14 @@
+services:
+  echo:
+    build: .
+    ports:
+      - 8888:8000
+    command: [ "./server", "echo", "--host=0.0.0.0" ]
+
+  static:
+    build: .
+    ports:
+      - 8000:8000
+    volumes:
+      - ./public:/app/public
+    command: [ "./server", "fs", "public", "--host=0.0.0.0" ]

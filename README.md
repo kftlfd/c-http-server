@@ -65,6 +65,14 @@ $ ./server fs <path>
 $ ./server --help
 ```
 
+## Docker
+
+```bash
+$ docker compose up [echo | static]
+# localhost:8888 -> echo
+# localhost:8000 -> static files from `public/`
+```
+
 # TODO:
 
 - retry reading files until `size`
@@ -72,7 +80,7 @@ $ ./server --help
 - LRU file cache
 - more complete MIME type handling
 - configuration (limits, timeouts)
-- `writev() + `struct iovec` (`<sys/uio.h>`) for concurrency-safe logs
+- `writev()` + `struct iovec` (`<sys/uio.h>`) for concurrency-safe logs
 - don't operate directly on `request.buffer` during parsing
 - split Request into `raw_request_t` (buffer + lengths) and `http_request_t` (method, path, headers)
 - split `create_fs_response` function
