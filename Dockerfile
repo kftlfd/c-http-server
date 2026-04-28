@@ -1,7 +1,8 @@
-FROM ubuntu:26.04
+# ========== Build
 
-RUN apt-get update && \
-    apt-get install -y gcc libc6-dev make
+FROM alpine:3.22.4 AS build
+
+RUN apk add build-base
 
 WORKDIR /app
 
@@ -10,4 +11,10 @@ COPY Makefile Makefile
 
 RUN make all
 
-EXPOSE 8000
+# ========== Final
+
+FROM alpine:3.22.4
+
+WORKDIR /app
+
+COPY --from=build /app/server /bin

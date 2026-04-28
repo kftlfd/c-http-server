@@ -12,7 +12,7 @@
 - connection timeouts
 - basic pipelining support
 
-## Limitations:
+## Limitations
 
 - only HTTP/1.1 (no HTTP/2, no TLS)
 - only GET+HEAD supported in fs mode (no POST, etc.)
@@ -32,7 +32,7 @@
   - max request size
   - max file size
 
-## Security notes:
+## Security notes
 
 - prevents directory traversal ("..")
 - restricts allowed path characters
@@ -73,7 +73,7 @@ $ docker compose up [echo | static]
 # localhost:8000 -> static files from `public/`
 ```
 
-# TODO:
+# TODO
 
 - retry reading files until `size`
 - sendfile() / streaming responses for large files
