@@ -232,7 +232,7 @@ int setup_server(server_config_t* config) {
 
     // INADDR_LOOPBACK (localhost, 127.0.0.1) can cause portability issues
     // address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) != 1) {
+    if (inet_pton(AF_INET, config->host, &address.sin_addr) != 1) {
         LOG_PERROR("inet_pton failed");
         exit(EXIT_FAILURE);
     }
@@ -732,7 +732,7 @@ void start_server(server_config_t* config) {
 
     LOG_INFO("mode=%s, log-level=%d, timeout=%dms",
         config->mode == MODE_ECHO ? "echo" : "fs", LOG_LEVEL, config->keep_alive_timeout_ms);
-    LOG_INFO("Server is listening on port %d...", config->port);
+    LOG_INFO("Server is listening on %s:%d...", config->host, config->port);
 
     /**
      * At this point, the server is ready to accept connections.

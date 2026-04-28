@@ -56,10 +56,21 @@ $ make all
 
 ```bash
 # echo
-$ ./server echo
+$ ./server [echo]
 
 # serve static files
 $ ./server fs <path>
+
+# see all options with
+$ ./server --help
+```
+
+## Docker
+
+```bash
+$ docker compose up [echo | static]
+# localhost:8888 -> echo
+# localhost:8000 -> static files from `public/`
 ```
 
 # TODO:
@@ -68,8 +79,8 @@ $ ./server fs <path>
 - sendfile() / streaming responses for large files
 - LRU file cache
 - more complete MIME type handling
-- configuration (port, limits, timeouts)
-- `writev() + `struct iovec` (`<sys/uio.h>`) for concurrency-safe logs
+- configuration (limits, timeouts)
+- `writev()` + `struct iovec` (`<sys/uio.h>`) for concurrency-safe logs
 - don't operate directly on `request.buffer` during parsing
 - split Request into `raw_request_t` (buffer + lengths) and `http_request_t` (method, path, headers)
 - split `create_fs_response` function
