@@ -40,6 +40,16 @@ body {
   align-self: center;
 }
 
+.row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.mt-5 {
+  margin-top: 20px;
+}
+
 .hero h1 {
   margin-top: 0;
   font-size: 28px;
@@ -60,9 +70,12 @@ body {
   margin-bottom: 6px;
 }
 
+.hero a {
+  color: var(--accent);
+}
+
 .hero a.button {
   display: inline-block;
-  margin-top: 20px;
   padding: 10px 16px;
   border-radius: 8px;
   background: var(--accent);
@@ -89,4 +102,9 @@ body {
   padding: 2px 6px;
   border-radius: 6px;
   font-size: 0.9em;
+}
+
+.markdown-body {
+  width: 100vw;
+  max-width: 900px;
 }

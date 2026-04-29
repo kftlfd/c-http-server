@@ -4,17 +4,12 @@ services:
     build: .
     ports:
       - 8888:8000
-    expose:
-      - 8000
-    command: [ "server", "echo", "--host=0.0.0.0", "--port=8000" ]
 
   static:
     image: kftlfd/c-http-server:1.0
     build: .
     ports:
       - 8000:8000
-    expose:
-      - 8000
     volumes:
-      - ./public:/app/public
-    command: [ "server", "fs", "public", "--host=0.0.0.0", "--port=8000" ]
+      - ./public:/app/html
+    command: [ "server", "fs", "/app/html", "--host=0.0.0.0", "--port=8000" ]
